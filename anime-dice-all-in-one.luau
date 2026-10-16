@@ -1,239 +1,268 @@
---// Anime Dice — All-in-One (Tutorial → AutoRoll → Reach 1000 Total Rolls) \\--
--- Does: complete tutorial (1→14), apply post-tutorial (AutoSell=1qd, Performance ON),
---       spawn aggressive perf optimizer in background, enable Auto Roll, farm until
---       total Rolls >= TARGET_ROLLS (default 1000) to unlock Trade.
--- All changes are client-side, official remotes only. Idempotent + self-healing.
+--// Anime Dice — All-in-One \\--
+-- Tutorial (1→14) → pasca-tutorial (AutoSell=1qd, Perf ON, Music=0, HideGears ON)
+-- → perf optimizer → Auto Roll → farm sampai Rolls >= 1000 (unlock Trade).
+-- Remote resmi saja. Idempotent, self-healing, re-run = restart (tidak menumpuk).
 --
 -- Usage: loadstring(readfile("anime-dice-all-in-one.luau"))()
+-- Stop  : getgenv().animeDiceAllInOne.stop()
+-- Test  : getgenv().animeDiceAllInOne.notify(true)  -- kirim webhook percobaan ke Discord
+-- Note  : Rolls >= 1000 → notifikasi Discord; Rolls >= 1001 → disconnect dari game
 
-local TARGET_ROLLS = 1000
+local TARGET_ROLLS = 1000 -- TradeConfig.MIN_ROLLS
 
---// Services \\--
+--// Services & modules \\--
 local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local Lighting = game:GetService("Lighting")
+local RS = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
-local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
+local NET = RS:WaitForChild("Network")
+local DC = require(RS.Framework.Features.Data.DataController)
+local EntryRegistry = require(RS.Framework.Features.Inventory.EntryRegistry)
 
---// Remotes / Modules \\--
-local Network = ReplicatedStorage:WaitForChild("Network")
-local RollService = Network:WaitForChild("Rolling"):WaitForChild("RollService")
-local RF_RollDice = RollService:WaitForChild("RF"):WaitForChild("RollDice")
-local RE_SetAutoRoll = RollService:WaitForChild("RE"):WaitForChild("SetAutoRoll")
+--// Remotes (struktur FLAT: Network.<Service>.RE|RF.<Signal>) \\--
+local RF_RollDice = NET:WaitForChild("RollService"):WaitForChild("RF"):WaitForChild("RollDice")
+local RE_SetAutoRoll = NET:WaitForChild("RollService"):WaitForChild("RE"):WaitForChild("SetAutoRoll")
+local RE_Advance = NET:WaitForChild("OnboardingService"):WaitForChild("RE"):WaitForChild("Advance")
+local RF_Equip = NET:WaitForChild("UnitService"):WaitForChild("RF"):WaitForChild("Equip")
+local RE_InteractSlot = NET:WaitForChild("PlotService"):WaitForChild("RE"):WaitForChild("InteractSlot")
+local RE_Collect = NET:WaitForChild("PlotService"):WaitForChild("RE"):WaitForChild("CollectBalance")
+local RE_BuyDice = NET:WaitForChild("DiceShopService"):WaitForChild("RE"):WaitForChild("BuyDice")
+local RE_SetSetting = NET:WaitForChild("SettingsService"):WaitForChild("RE"):WaitForChild("SetSetting")
 
-local OnboardingService = Network:WaitForChild("Onboarding"):WaitForChild("OnboardingService")
-local RE_Advance = OnboardingService:WaitForChild("RE"):WaitForChild("Advance")
+--// Config \\--
+local DICE_NAME = "Normal"
+local SLOT = 1
+local AUTO_SELL_TARGET = 1e15 -- 1qd
+local FORCED = { [2] = true, [9] = true, [10] = true, [13] = true }
 
-local UnitService = Network:WaitForChild("Units"):WaitForChild("UnitService")
-local RF_Equip = UnitService:WaitForChild("RF"):WaitForChild("Equip")
+-- Discord webhook: dikirim sekali saat Rolls mencapai TARGET_ROLLS
+local WEBHOOK_ENABLED = true
+local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1422109131006808156/FzTcL84FAs4hfeBXUXnEad0RQrWXiVzd8bZwlqnc2IKq-W1zVZVFIhP66IPJi1yuhkR8"
 
-local PlotService = Network:WaitForChild("Plots"):WaitForChild("PlotService")
-local RE_InteractSlot = PlotService:WaitForChild("RE"):WaitForChild("InteractSlot")
-local RE_CollectBalance = PlotService:WaitForChild("RE"):WaitForChild("CollectBalance")
+-- Disconnect client saat target tercapai (1001 = lewat 1000, supaya server pasti mencatat)
+local LEAVE_ON_TARGET = true
+local LEAVE_AFTER_ROLLS = TARGET_ROLLS + 1
 
-local DiceShopService = Network:WaitForChild("Shops"):WaitForChild("DiceShopService")
-local RE_BuyDice = DiceShopService:WaitForChild("RE"):WaitForChild("BuyDice")
+local ZONES_OK, ZONES_SHOP, ZONES_DICE = pcall(function()
+	return true, Workspace.Zones.ShopArea.Position, Workspace.Zones.DiceShop.Position
+end)
+if not ZONES_OK then
+	ZONES_SHOP = Vector3.new(285.52, 4.04, -272.57)
+	ZONES_DICE = Vector3.new(285.48, 10.97, -304.35)
+end
 
-local SettingsService = Network:WaitForChild("SettingsService")
-local RE_SetSetting = SettingsService:WaitForChild("RE"):WaitForChild("SetSetting")
+--// State readers (pcall-safe; aksesor langsung pola DataController) \\--
+local function readNum(fn)
+	local ok, v = pcall(fn)
+	return ok and tonumber(v) or nil
+end
 
--- Data controller (for read-only state)
-local DataFolder = ReplicatedStorage:WaitForChild("Framework"):WaitForChild("Features"):WaitForChild("Data")
-local DataController = require(DataFolder:WaitForChild("DataController"))
+local function stepNow()
+	return readNum(function()
+		return DC.OnboardingStep()
+	end) or -1
+end
 
---// State helpers \\--
-local function getState()
-	local ok, s = pcall(function()
-		return DataController:GetState()
+local function rollsNow()
+	local v = readNum(function()
+		return DC.Rolls()
 	end)
-	if ok and type(s) == "table" then
-		return s
-	end
-	return {}
-end
-
-local function charPos()
-	local c = LocalPlayer.Character
-	local hrp = c and c:FindFirstChild("HumanoidRootPart")
-	if hrp then
-		return hrp.Position
-	end
-	return Vector3.new(0, 0, 0)
-end
-
-local function teleportTo(p)
-	local c = LocalPlayer.Character
-	local hrp = c and c:FindFirstChild("HumanoidRootPart")
-	if hrp then
-		hrp.CFrame = CFrame.new(p + Vector3.new(0, 3, 0))
-	end
-end
-
-local function hasNormalDice()
-	local st = getState()
-	local od = st.OwnedDice or {}
-	return od.Normal == true
-end
-
-local function rollsTotal()
-	local st = getState()
-	local r = st.Rolls
-	if type(r) == "number" then
-		return r
-	end
-	return 0
-end
-
-local function onboardingStep()
-	local st = getState()
-	local v = st.OnboardingStep
-	if type(v) == "number" then
+	if v then
 		return v
 	end
-	return 0
+	-- fallback: leaderstats
+	return readNum(function()
+		return LocalPlayer.leaderstats.Rolls.Value
+	end) or 0
 end
 
-local function money()
-	local st = getState()
-	local m = st.Money
-	if type(m) == "number" then
-		return m
+local function moneyNow()
+	return readNum(function()
+		return DC.Money()
+	end) or 0
+end
+
+local function autoRollNow()
+	local ok, v = pcall(function()
+		return DC.AutoRoll()
+	end)
+	return ok and v == true
+end
+
+local function ownNormal()
+	local ok, v = pcall(function()
+		return DC.OwnedDice[DICE_NAME]()
+	end)
+	return ok and v == true
+end
+
+local function firstUnitKey()
+	local ok, inv = pcall(function()
+		return DC.Inventory()
+	end)
+	if not ok or type(inv) ~= "table" then
+		return nil
 	end
-	return 0
+	for key, entry in inv do
+		local cfg = EntryRegistry.getEntryConfig(entry.name)
+		if cfg and cfg.kind == "Unit" then
+			return key, entry.name
+		end
+	end
+	return nil
 end
 
-local function autoRollOn()
-	local st = getState()
-	local ar = st.AutoRoll
-	if type(ar) == "boolean" then
-		return ar
+local function slotBalance()
+	return readNum(function()
+		local s = DC.Slots()[tostring(SLOT)]
+		return s and s.balance
+	end) or 0
+end
+
+local function charRoot()
+	local c = LocalPlayer.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function safe(fn, ...)
+	pcall(fn, ...)
+end
+
+-- HTTP POST lintas-executor (request/http_request/syn/fluxus/krnl/HttpService) untuk Discord
+local function httpPost(url, payload)
+	local okEnc, body = pcall(function()
+		return HttpService:JSONEncode(payload)
+	end)
+	if not okEnc then
+		return false, "JSONEncode: " .. tostring(body)
+	end
+
+	local env = (type(getgenv) == "function") and getgenv() or _G
+	local candidates = {}
+	local function add(name, f)
+		if type(f) == "function" then
+			table.insert(candidates, { name = name, fn = f })
+		end
+	end
+	for _, n in ipairs({ "request", "http_request", "http_post", "HttpPost", "httpRequest" }) do
+		add(n, env[n])
+		if env ~= _G then
+			add(n, _G[n])
+		end
+	end
+	if type(syn) == "table" then
+		add("syn.request", syn.request)
+	end
+	if type(http) == "table" then
+		add("http.request", http.request)
+	end
+	if type(fluxus) == "table" then
+		add("fluxus.request", fluxus.request)
+	end
+	if type(krnl) == "table" then
+		add("krnl.request", krnl.request)
+	end
+	add("HttpService:RequestAsync", function(opts)
+		return HttpService:RequestAsync(opts)
+	end)
+
+	local lastErr
+	for _, c in ipairs(candidates) do
+		local ok, res = pcall(c.fn, {
+			Url = url,
+			Method = "POST",
+			Headers = { ["Content-Type"] = "application/json" },
+			Body = body,
+		})
+		if ok and type(res) == "table" then
+			local code = res.StatusCode or res.status or res.Status
+			if res.Success == true or (type(code) == "number" and code >= 200 and code < 300) then
+				return true, c.name .. " " .. tostring(code or "")
+			end
+			lastErr = c.name .. " HTTP " .. tostring(code)
+		else
+			lastErr = c.name .. ": " .. tostring(res)
+		end
+	end
+	return false, tostring(lastErr)
+end
+
+local function notifyTradeReady(rolls, isTest)
+	local acc = LocalPlayer
+	local payload = {
+		username = "Anime Dice Auto-Farm",
+		embeds = {
+			{
+				title = (isTest and "[TEST] " or "") .. "Rolls target reached",
+				description = ("**%s** reached **%d / %d** rolls (Trade roll-gate)."):format(acc.Name, rolls, TARGET_ROLLS),
+				color = isTest and 8421504 or 5763719,
+				fields = {
+					{ name = "Account", value = tostring(acc.Name), inline = true },
+					{ name = "Display name", value = tostring(acc.DisplayName), inline = true },
+					{ name = "User ID", value = tostring(acc.UserId), inline = true },
+					{ name = "Rolls", value = ("%d / %d"):format(rolls, TARGET_ROLLS), inline = true },
+					{ name = "Account age", value = tostring(acc.AccountAge) .. " days", inline = true },
+					{ name = "Money", value = tostring(moneyNow()), inline = true },
+					{ name = "Place ID", value = tostring(game.PlaceId), inline = true },
+					{ name = "Job ID", value = tostring(game.JobId), inline = true },
+				},
+				timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+			},
+		},
+	}
+	local ok, info = httpPost(DISCORD_WEBHOOK, payload)
+	print(("[aio] discord webhook %s: %s"):format(ok and "OK" or "GAGAL", tostring(info)))
+	return ok, info
+end
+
+-- Keluar dari game (disconnect). game:Shutdown() = metode standar; fallback ke global executor.
+local function leaveGame()
+	local env = (type(getgenv) == "function") and getgenv() or _G
+	local attempts = {}
+	for _, n in ipairs({ "leaveGame", "leave", "exitgame", "Exit" }) do
+		if type(env[n]) == "function" then
+			table.insert(attempts, { name = n, fn = env[n] })
+		end
+	end
+	table.insert(attempts, { name = "game:Shutdown", fn = function()
+		game:Shutdown()
+	end })
+	table.insert(attempts, { name = "LocalPlayer:Kick", fn = function()
+		LocalPlayer:Kick("[aio] target reached")
+	end })
+	for _, a in ipairs(attempts) do
+		local ok, err = pcall(a.fn)
+		print(("[aio] leave via %s -> %s"):format(a.name, ok and "ok" or tostring(err)))
+		if ok then
+			return true, a.name
+		end
 	end
 	return false
 end
 
-local function equipNormal()
-	pcall(function()
-		RF_Equip:InvokeServer("Normal")
-	end)
-end
-
-local function buyNormal()
-	pcall(function()
-		RE_BuyDice:FireServer("Normal")
-	end)
-end
-
-local function rollOnce()
-	pcall(function()
-		RF_RollDice:InvokeServer()
-	end)
-end
-
-local function setAutoRoll(v)
-	pcall(function()
-		RE_SetAutoRoll:FireServer(v)
-	end)
-end
-
-local function advance()
-	pcall(function()
-		RE_Advance:FireServer()
-	end)
-end
-
-local function interactSlot1()
-	pcall(function()
-		RE_InteractSlot:FireServer(1)
-	end)
-end
-
-local function collectSlot1()
-	pcall(function()
-		RE_CollectBalance:FireServer(1)
-	end)
-end
-
-local function applyPostTutorial()
-	pcall(function()
-		RE_SetSetting:FireServer("AutoSell", 1000000000000000)
-	end)
-	pcall(function()
-		RE_SetSetting:FireServer("Performance", true)
-	end)
-	pcall(function()
-		RE_SetSetting:FireServer("Music", 0)
-	end)
-	pcall(function()
-		RE_SetSetting:FireServer("HideGears", true)
-	end)
-end
-
--- Zones
-local Z_SHOP_AREA = Vector3.new(285.52, 4.04, -272.57)
-local Z_DICE_SHOP = Vector3.new(285.48, 10.97, -304.35)
-
--- Tutorial reconcile
-local function reconcile()
-	local st = getState()
-	local step = onboardingStep()
-	local ok = true
-
-	if step == 1 then
-		if st.Units and st.Units.Normal then
-			ok = false
-		end
-	elseif step == 3 then
-		if st.Equipped and st.Equipped == "Normal" then
-			ok = false
-		end
-	elseif step == 4 then
-		local slots = st.Slots or {}
-		if slots[1] and slots[1].Unit and slots[1].Unit.Key == "Normal" then
-			ok = false
-		end
-	elseif step == 5 then
-		if money() > 0 then
-			ok = false
-		end
-	elseif step == 6 then
-		local p = charPos()
-		if (p - Z_SHOP_AREA).Magnitude < 6 then
-			ok = false
-		end
-	elseif step == 7 then
-		local p = charPos()
-		if (p - Z_DICE_SHOP).Magnitude < 15 then
-			ok = false
-		end
-	elseif step == 8 then
-		if hasNormalDice() then
-			ok = false
-		end
-	elseif step == 11 then
-		if rollsTotal() > 1 then
-			ok = false
-		end
-	elseif step == 12 then
-		if autoRollOn() then
-			ok = false
-		end
+local function teleportTo(pos)
+	local r = charRoot()
+	if not r then
+		return
 	end
-	return ok
+	if (r.Position - pos).Magnitude < 8 then
+		return -- sudah di tempat, jangan jitter
+	end
+	pcall(function()
+		LocalPlayer.Character:PivotTo(CFrame.new(pos + Vector3.new(0, 3, 0)))
+	end)
 end
 
-local forced = { [2] = true, [9] = true, [10] = true, [13] = true }
-
---// PERF OPTIMIZER (inlined, safe, with stop API + self-replace) \\--
+--// PERF OPTIMIZER (inline, dari anime-dice-perf.luau yang sudah teruji) \\--
 do
 	local ENV = (type(getgenv) == "function") and getgenv() or _G
 	if type(ENV.animeDicePerf) == "table" and type(ENV.animeDicePerf.stop) == "function" then
 		pcall(ENV.animeDicePerf.stop)
 	end
-	if ENV.__animeDicePerfLoaded then
-		-- already loaded; don't spawn duplicate loops here
-	else
+	if not ENV.__animeDicePerfLoaded then
 		ENV.__animeDicePerfLoaded = true
 
 		local CFG = {
@@ -252,8 +281,7 @@ do
 			killParticles = true,
 			destroyBeamsTrails = true,
 			destroyLegacyFx = true,
-			gameMusicVolume = 0,
-			enableGameToggles = false, -- we apply toggles ourselves in main flow
+			enableGameToggles = false, -- toggle diapply oleh flow utama (applyPostTutorial)
 			cullGuiDistance = 160,
 			freezeAnimations = true,
 			freezeDistance = 160,
@@ -261,28 +289,15 @@ do
 			sweepSeconds = 3,
 		}
 
-		local OVERRIDE = (type(ENV.__animeDicePerfConfig) == "table") and ENV.__animeDicePerfConfig or nil
-		if OVERRIDE then
-			for k, v in pairs(OVERRIDE) do
-				if CFG[k] ~= nil then
-					CFG[k] = v
-				end
-			end
-		end
-
-		local function log(...)
+		local function plog(...)
 			print("[perf]", ...)
 		end
 		local function try(label, fn)
 			local ok, err = pcall(fn)
 			if not ok then
-				log(("gagal %s: %s"):format(label, tostring(err)))
+				plog(("gagal %s: %s"):format(label, tostring(err)))
 			end
 			return ok
-		end
-		local function root()
-			local c = LocalPlayer.Character
-			return c and c:FindFirstChild("HumanoidRootPart")
 		end
 		local function posOf(inst)
 			if not inst then
@@ -315,19 +330,15 @@ do
 			end
 			if cur ~= lastQuality then
 				lastQuality = cur
-				log(("QualityLevel = %s (ingin %s)"):format(cur, tostring(CFG.qualityLevel)))
+				plog(("QualityLevel = %s (ingin %s)"):format(cur, tostring(CFG.qualityLevel)))
 			end
-			if CFG.globalShadows ~= nil then
-				try("GlobalShadows", function()
-					Lighting.GlobalShadows = CFG.globalShadows
-				end)
-			end
-			if CFG.environmentScale then
-				try("EnvironmentScale", function()
-					Lighting.EnvironmentDiffuseScale = CFG.environmentScale
-					Lighting.EnvironmentSpecularScale = CFG.environmentScale
-				end)
-			end
+			try("GlobalShadows", function()
+				Lighting.GlobalShadows = CFG.globalShadows
+			end)
+			try("EnvironmentScale", function()
+				Lighting.EnvironmentDiffuseScale = CFG.environmentScale
+				Lighting.EnvironmentSpecularScale = CFG.environmentScale
+			end)
 			if CFG.disablePostFx then
 				for _, e in Lighting:GetChildren() do
 					if e:IsA("PostEffect") or e:IsA("SunRaysEffect") then
@@ -335,14 +346,6 @@ do
 							e.Enabled = false
 						end)
 					end
-				end
-			end
-			if CFG.disableAtmosphere then
-				local atmo = Lighting:FindFirstChildOfClass("Atmosphere")
-				if atmo then
-					try("destroy Atmosphere", function()
-						atmo:Destroy()
-					end)
 				end
 			end
 		end
@@ -353,33 +356,20 @@ do
 			end
 			local cap = CFG.fpsCap
 			local candidates = {}
-			local function add(name, fn)
-				table.insert(candidates, { name = name, fn = fn })
-			end
 			if type(debug) == "table" and type(debug.setfpscap) == "function" then
-				add("debug.setfpscap", function()
+				table.insert(candidates, { name = "debug.setfpscap", fn = function()
 					debug.setfpscap(cap)
-				end)
+				end })
 			end
-			local envs = {}
-			pcall(function()
-				envs[#envs + 1] = getgenv()
-			end)
-			pcall(function()
-				envs[#envs + 1] = _G
-			end)
-			for _, env in envs do
-				for _, name in { "setfpscap", "setFpsCap", "set_fps_cap", "setFPS" } do
+			for _, env in { (pcall(getgenv) and getgenv() or _G), _G } do
+				for _, name in { "setfpscap", "setFpsCap", "set_fps_cap" } do
 					local f = env[name]
 					if type(f) == "function" then
-						add(name, function()
+						table.insert(candidates, { name = name, fn = function()
 							f(cap)
-						end)
+						end })
 					end
 				end
-			end
-			if #candidates == 0 then
-				return
 			end
 			for _, c in candidates do
 				if try("fpsCap via " .. c.name, c.fn) then
@@ -389,9 +379,6 @@ do
 		end
 
 		local function applyStreaming()
-			if not CFG.streamEnabled then
-				return
-			end
 			local available = pcall(function()
 				return Workspace.StreamingTargetRadius
 			end)
@@ -414,23 +401,11 @@ do
 			end)
 		end
 
-		local function applyGameSettings()
-			if not CFG.enableGameToggles then
-				return
-			end
-			pcall(function()
-				local setSetting = Network.SettingsService.RE.SetSetting
-				setSetting:FireServer("Music", CFG.gameMusicVolume)
-				setSetting:FireServer("HideGears", true)
-				setSetting:FireServer("Performance", true)
-			end)
-		end
-
 		local guis, animators = {}, {}
 		local function destroyLater(inst)
 			task.defer(function()
 				if inst.Parent then
-					pcall(function()
+					safe(function()
 						inst:Destroy()
 					end)
 				end
@@ -438,11 +413,11 @@ do
 		end
 		local function onAdded(d)
 			if CFG.killLights and d:IsA("Light") then
-				pcall(function()
+				safe(function()
 					d.Enabled = false
 				end)
 			elseif CFG.killParticles and d:IsA("ParticleEmitter") then
-				pcall(function()
+				safe(function()
 					d.Enabled = false
 					d:Clear()
 				end)
@@ -458,7 +433,10 @@ do
 				table.insert(animators, d)
 			end
 		end
-		local function bulkPass()
+
+		task.spawn(function()
+			local RUNNING = true
+			applyFpsCap()
 			pcall(function()
 				for _, d in Workspace:GetDescendants() do
 					onAdded(d)
@@ -466,54 +444,6 @@ do
 			end)
 			applyRender()
 			applyStreaming()
-		end
-		local function sweep()
-			local hrp = root()
-			if not hrp then
-				return
-			end
-			local p = hrp.Position
-			for i = #guis, 1, -1 do
-				local g = guis[i]
-				if not g.Parent then
-					table.remove(guis, i)
-				else
-					local gp = posOf(g.Adornee or g.Parent)
-					if gp then
-						local want = (gp - p).Magnitude <= CFG.cullGuiDistance
-						if g.Enabled ~= want then
-							pcall(function()
-								g.Enabled = want
-							end)
-						end
-					end
-				end
-			end
-			if CFG.freezeAnimations then
-				for i = #animators, 1, -1 do
-					local a = animators[i]
-					if not a.Parent then
-						table.remove(animators, i)
-					else
-						local mp = posOf(a:FindFirstAncestorOfClass("Model"))
-						if mp then
-							local speed = ((mp - p).Magnitude > CFG.freezeDistance) and 0 or 1
-							pcall(function()
-								for _, track in a:GetPlayingAnimationTracks() do
-									track:AdjustSpeed(speed)
-								end
-							end)
-						end
-					end
-				end
-			end
-		end
-
-		task.spawn(function()
-			local RUNNING = true
-			applyFpsCap()
-			bulkPass()
-			applyGameSettings()
 			Workspace.DescendantAdded:Connect(onAdded)
 			task.spawn(function()
 				while RUNNING do
@@ -523,7 +453,42 @@ do
 			end)
 			task.spawn(function()
 				while RUNNING do
-					sweep()
+					local hrp = charRoot()
+					local p = hrp and hrp.Position
+					if p then
+						for i = #guis, 1, -1 do
+							local g = guis[i]
+							if not g.Parent then
+								table.remove(guis, i)
+							else
+								local gp = posOf(g.Adornee or g.Parent)
+								if gp then
+									local want = (gp - p).Magnitude <= CFG.cullGuiDistance
+									if g.Enabled ~= want then
+										safe(function()
+											g.Enabled = want
+										end)
+									end
+								end
+							end
+						end
+						for i = #animators, 1, -1 do
+							local a = animators[i]
+							if not a.Parent then
+								table.remove(animators, i)
+							else
+								local mp = posOf(a:FindFirstAncestorOfClass("Model"))
+								if mp then
+									local speed = ((mp - p).Magnitude > CFG.freezeDistance) and 0 or 1
+									safe(function()
+										for _, track in a:GetPlayingAnimationTracks() do
+											track:AdjustSpeed(speed)
+										end
+									end)
+								end
+							end
+						end
+					end
 					task.wait(CFG.sweepSeconds)
 				end
 			end)
@@ -534,109 +499,197 @@ do
 					ENV.__animeDicePerfLoaded = nil
 				end,
 			}
-			log("aktif (all-in-one)")
+			plog("aktif (all-in-one)")
 		end)
 	end
 end
 
---// Main flow \\--
+--// MAIN FLOW \\--
 local PHASE = "TUTORIAL"
+local lastFire = {} -- throttle aksi per step
 local lastLog = 0
-local farmReenable = 0
+local RUNNING = true
+local ENV = (type(getgenv) == "function") and getgenv() or _G
+
+-- guard terhadap instance all-in-one lama
+if type(ENV.animeDiceAllInOne) == "table" and type(ENV.animeDiceAllInOne.stop) == "function" then
+	pcall(ENV.animeDiceAllInOne.stop)
+end
+ENV.animeDiceAllInOne = {
+	stop = function()
+		RUNNING = false
+	end,
+	notify = function(isTest)
+		return notifyTradeReady(rollsNow(), isTest == true)
+	end,
+	leave = function()
+		return leaveGame()
+	end,
+	webhookUrl = DISCORD_WEBHOOK,
+}
+
+local function throttle(step, interval)
+	local now = os.clock()
+	if (lastFire[step] or 0) + (interval or 0.8) <= now then
+		lastFire[step] = now
+		return true
+	end
+	return false
+end
+
+local function applyPostTutorial()
+	safe(function()
+		RE_SetSetting:FireServer("AutoSell", AUTO_SELL_TARGET)
+	end)
+	safe(function()
+		RE_SetSetting:FireServer("Performance", true)
+	end)
+	safe(function()
+		RE_SetSetting:FireServer("Music", 0)
+	end)
+	safe(function()
+		RE_SetSetting:FireServer("HideGears", true)
+	end)
+end
+
+local function stepAction(step)
+	-- aksi per step (pola persis tutorial teruji); throttle agar tidak spam remote
+	if FORCED[step] then
+		if throttle(step, 0.9) then
+			safe(function()
+				RE_Advance:FireServer()
+			end)
+		end
+		return
+	end
+
+	if step == 1 then
+		if firstUnitKey() == nil and throttle(step, 1.2) then
+			safe(function()
+				RF_RollDice:InvokeServer()
+			end)
+		end
+	elseif step == 3 then
+		local key = firstUnitKey()
+		if key and throttle(step, 1.0) then
+			safe(function()
+				RF_Equip:InvokeServer(key)
+			end)
+		end
+	elseif step == 4 then
+		if throttle(step, 1.2) then
+			safe(function()
+				RE_InteractSlot:FireServer(SLOT)
+			end)
+		end
+	elseif step == 5 then
+		if slotBalance() > 0 and throttle(step, 1.0) then
+			safe(function()
+				RE_Collect:FireServer(SLOT)
+			end)
+		end
+	elseif step == 6 then
+		teleportTo(ZONES_SHOP)
+	elseif step == 7 then
+		teleportTo(ZONES_DICE)
+	elseif step == 8 then
+		if not ownNormal() and moneyNow() >= 1 and throttle(step, 1.5) then
+			safe(function()
+				RE_BuyDice:FireServer(DICE_NAME)
+			end)
+		elseif slotBalance() > 0 and throttle(step, 1.0) then
+			safe(function()
+				RE_Collect:FireServer(SLOT)
+			end)
+		end
+	elseif step == 11 then
+		if throttle(step, 1.2) then
+			safe(function()
+				RF_RollDice:InvokeServer()
+			end)
+		end
+	elseif step == 12 then
+		if not autoRollNow() and throttle(step, 1.0) then
+			safe(function()
+				RE_SetAutoRoll:FireServer(true)
+			end)
+		end
+	end
+end
 
 task.spawn(function()
-	while true do
+	while RUNNING do
 		local now = os.clock()
+		local ok, step = pcall(stepNow)
+		step = ok and step or -1
 
 		if PHASE == "TUTORIAL" then
-			local step = onboardingStep()
 			if step >= 14 then
-				PHASE = "FARM"
-				applyPostTutorial()
-				setAutoRoll(true)
+				PHASE = "POST"
+				lastLog = 0
+			else
+				stepAction(step)
 				if now - lastLog > 2 then
 					lastLog = now
-					print(("[aio] tutorial selesai (step=%d), masuk FARM | Rolls=%d"):format(step, rollsTotal()))
-				end
-			else
-				if now - lastLog > 1.5 then
-					lastLog = now
-					print(("[aio] tutorial step=%d | Rolls=%d Money=%.0f AR=%s"):format(step, rollsTotal(), money(), tostring(autoRollOn())))
-				end
-				if reconcile() then
-					if forced[step] then
-						advance()
-						task.wait(0.4)
-					else
-						if step == 1 then
-							rollOnce()
-							task.wait(0.5)
-						elseif step == 3 then
-							equipNormal()
-							task.wait(0.4)
-						elseif step == 4 then
-							interactSlot1()
-							task.wait(0.5)
-						elseif step == 5 then
-							collectSlot1()
-							task.wait(0.4)
-						elseif step == 6 then
-							teleportTo(Z_SHOP_AREA)
-							task.wait(0.6)
-						elseif step == 7 then
-							teleportTo(Z_DICE_SHOP)
-							task.wait(0.8)
-						elseif step == 8 then
-							if not hasNormalDice() then
-								buyNormal()
-							end
-							task.wait(0.6)
-						elseif step == 11 then
-							rollOnce()
-							task.wait(0.5)
-						elseif step == 12 then
-							setAutoRoll(true)
-							task.wait(0.4)
-						else
-							task.wait(0.4)
-						end
-					end
-				else
-					task.wait(0.4)
+					print(("[aio] TUTORIAL step=%d | Rolls=%d Money=%d"):format(step, rollsNow(), moneyNow()))
 				end
 			end
 
+		elseif PHASE == "POST" then
+			applyPostTutorial()
+			PHASE = "FARM"
+			print("[aio] pasca-tutorial: AutoSell=1qd Perf=ON Music=0 HideGears=ON -> FARM")
+
 		elseif PHASE == "FARM" then
-			local r = rollsTotal()
+			local r = rollsNow()
 			if r >= TARGET_ROLLS then
 				PHASE = "DONE"
-				if now - lastLog > 1 then
-					lastLog = now
-					print(("[aio] DONE — Rolls=%d >= %d (Trade siap)"):format(r, TARGET_ROLLS))
+				print(("[aio] DONE — Rolls=%d >= %d, Trade UNLOCKED"):format(r, TARGET_ROLLS))
+				if WEBHOOK_ENABLED and not ENV.__aioNotified then
+					ENV.__aioNotified = true
+					task.spawn(function()
+						notifyTradeReady(r, false)
+					end)
 				end
+				lastLog = 0
 			else
-				if now - lastLog > 3 then
-					lastLog = now
-					print(("[aio] FARM Rolls=%d/%d | AR=%s Money=%.0f"):format(r, TARGET_ROLLS, tostring(autoRollOn()), money()))
+				-- pastikan Auto Roll tetap nyala
+				if not autoRollNow() and throttle(999, 10) then
+					safe(function()
+						RE_SetAutoRoll:FireServer(true)
+					end)
 				end
-				if not autoRollOn() and now - farmReenable > 5 then
-					farmReenable = now
-					setAutoRoll(true)
+				if now - lastLog > 5 then
+					lastLog = now
+					print(("[aio] FARM %d/%d | AutoRoll=%s Money=%d"):format(r, TARGET_ROLLS, tostring(autoRollNow()), moneyNow()))
 				end
 				task.wait(2)
 			end
 
 		elseif PHASE == "DONE" then
-			if now - lastLog > 10 then
+			local r2 = rollsNow()
+			if LEAVE_ON_TARGET and r2 >= LEAVE_AFTER_ROLLS then
+				print(("[aio] Rolls=%d >= %d — keluar dari game (disconnect)"):format(r2, LEAVE_AFTER_ROLLS))
+				task.wait(2) -- beri waktu webhook terkirim
+				leaveGame()
+				RUNNING = false
+				return
+			end
+			if not autoRollNow() and throttle(999, 15) then
+				safe(function()
+					RE_SetAutoRoll:FireServer(true)
+				end)
+			end
+			if now - lastLog > 15 then
 				lastLog = now
-				local r = rollsTotal()
-				print(("[aio] IDLE — Rolls=%d/%d (Trade siap)"):format(r, TARGET_ROLLS))
+				print(("[aio] IDLE — Rolls=%d/%d (menunggu %d utk disconnect)"):format(r2, TARGET_ROLLS, LEAVE_AFTER_ROLLS))
 			end
 			task.wait(5)
 		end
 
-		task.wait(0.25)
+		task.wait(0.3)
 	end
+	print("[aio] dihentikan")
 end)
 
-print(("[aio] dimulai — target Rolls >= %d"):format(TARGET_ROLLS))
+print(("[aio] mulai — target Rolls >= %d (Trade unlock; butuh akun >= 14 hari)"):format(TARGET_ROLLS))
