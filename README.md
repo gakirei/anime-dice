@@ -55,3 +55,37 @@ directly into your executor.
 - Idempotent: safe to re-run. Once `OnboardingStep >= 14` it only re-applies the
   post-tutorial settings.
 - Tested against `[🎉UPD 8] Anime Dice`.
+
+## Performance (Thermal/Resource Saver)
+
+[`anime-dice-perf.luau`](./anime-dice-perf.luau) is an aggressive, local-only client optimizer
+designed to reduce GPU/CPU load on mobile/cloudphone runs (FPS/thermal focus). All changes
+are client-side and wrapped with `pcall`.
+
+What it does (Delta/Android friendly):
+
+- Forces lowest quality: `QualityLevel = Level01` and disables FRM if needed (read-back
+  guard to avoid regressions).
+- Attempts FPS cap via `setfpscap`/`debug.setfpscap` probe (Delta has it).
+- Disables shadows, environment diffuse/specular, and all PostEffects; optionally destroys
+  legacy FX (Beams/Trails/Fire/Smoke/Sparkles).
+- Disables ~all `ParticleEmitter`s (bulk + DescendantAdded) and culls distant
+  `BillboardGui`/`SurfaceGui` (>160 studs).
+- Freezes far unit animations (`Animator:AdjustSpeed(0)` for distance >160 studs).
+- Applies official settings: `Music = 0`, `HideGears = true`, `Performance = true`
+  (once, via `SettingsService.RE.SetSetting`).
+
+Notes:
+
+- Streaming radius levers are game-dependent and may be unavailable in Anime Dice (detected
+  automatically and safely skipped).
+- Particles are the biggest measured lever: **~+31% FPS** in test (5.57 → 7.29).
+- Beams/Trails/legacy FX that are destroyed cannot be restored live (rejoin to reset).
+- Provides `ENV.animeDicePerf.stop()` to stop loops without rejoining.
+- Idempotent and self-replacing on re-run.
+
+Usage:
+
+```lua
+loadstring(readfile("anime-dice-perf.luau"))()
+```
