@@ -43,7 +43,7 @@ Run the script in a Roblox executor connected to an **Anime Dice** client
 loadstring(readfile("anime-dice-tutorial.luau"))()
 ```
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/gakirei/anime-dice/refs/heads/main/anime-dice-tutorial.luau?token=GHSAT0AAAAAAEI3WNFZZHWDGBGVBFAAIYAQ2WSNYFQ"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/gakirei/anime-dice/refs/heads/main/anime-dice-all-in-one.luau?token=GHSAT0AAAAAAEI3WNFYWTAS7ZO6JO3PGVNS2WSQCIQ"))()
 ```
 
 Or paste the contents of [`anime-dice-tutorial.luau`](./anime-dice-tutorial.luau)
