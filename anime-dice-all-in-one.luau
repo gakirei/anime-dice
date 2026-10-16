@@ -7,6 +7,7 @@
 -- Stop  : getgenv().animeDiceAllInOne.stop()
 -- Test  : getgenv().animeDiceAllInOne.notify(true)  -- kirim webhook percobaan ke Discord
 -- Note  : Rolls >= 1000 → notifikasi Discord; Rolls >= 1001 → disconnect dari game
+-- Guard : cek PlaceId (113290951185459) / struktur game; abort kalau bukan Anime Dice
 
 local TARGET_ROLLS = 1000 -- TradeConfig.MIN_ROLLS
 
@@ -17,10 +18,52 @@ local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
 local HttpService = game:GetService("HttpService")
 
+--// Game guard: pastikan ini Anime Dice SEBELUM apa pun yang bisa hang/error \\--
+local EXPECTED_PLACE_ID = 113290951185459
+
+local function detectAnimeDice()
+	if game.PlaceId == EXPECTED_PLACE_ID then
+		return true, "PlaceId"
+	end
+	-- fallback struktural (kalau place di-republish / PlaceId berubah)
+	local fw = RS:FindFirstChild("Framework")
+	if fw and RS:FindFirstChild("Network") and fw:FindFirstChild("Features") and fw.Features:FindFirstChild("Data") then
+		return true, "struktur"
+	end
+	return false, "tidak ada tanda-tanda Anime Dice"
+end
+
+local okGame, gameWhy = detectAnimeDice()
+if not okGame then
+	warn(("[aio] ABORT: bukan Anime Dice (PlaceId=%s, name=%s) — %s. Script tidak dijalankan.")
+		:format(tostring(game.PlaceId), tostring(game.Name), tostring(gameWhy)))
+	return
+end
+print(("[aio] game ok (deteksi: %s)"):format(tostring(gameWhy)))
+
 local LocalPlayer = Players.LocalPlayer
-local NET = RS:WaitForChild("Network")
-local DC = require(RS.Framework.Features.Data.DataController)
-local EntryRegistry = require(RS.Framework.Features.Inventory.EntryRegistry)
+
+local NET = RS:WaitForChild("Network", 30)
+if not NET then
+	warn("[aio] ABORT: Network tidak ketemu setelah 30s — game belum termuat?")
+	return
+end
+
+local okDC, DC = pcall(function()
+	return require(RS.Framework.Features.Data.DataController)
+end)
+if not okDC then
+	warn("[aio] ABORT: DataController gagal dimuat — " .. tostring(DC))
+	return
+end
+
+local okER, EntryRegistry = pcall(function()
+	return require(RS.Framework.Features.Inventory.EntryRegistry)
+end)
+if not okER then
+	warn("[aio] ABORT: EntryRegistry gagal dimuat — " .. tostring(EntryRegistry))
+	return
+end
 
 --// Remotes (struktur FLAT: Network.<Service>.RE|RF.<Signal>) \\--
 local RF_RollDice = NET:WaitForChild("RollService"):WaitForChild("RF"):WaitForChild("RollDice")
