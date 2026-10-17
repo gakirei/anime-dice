@@ -89,8 +89,10 @@ local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1422109131006808156/Fz
 local LEAVE_ON_TARGET = true
 local LEAVE_AFTER_ROLLS = TARGET_ROLLS + 1
 
+-- PENTING: jangan return literal `true` di dalam function ini — pcall mengembalikan
+-- (ok, ...), sehingga return true, A, B membuat ZONES_SHOP=true & ZONES_DICE=A (geser).
 local ZONES_OK, ZONES_SHOP, ZONES_DICE = pcall(function()
-	return true, Workspace.Zones.ShopArea.Position, Workspace.Zones.DiceShop.Position
+	return Workspace.Zones.ShopArea.Position, Workspace.Zones.DiceShop.Position
 end)
 if not ZONES_OK then
 	ZONES_SHOP = Vector3.new(285.52, 4.04, -272.57)
@@ -287,6 +289,10 @@ local function leaveGame()
 end
 
 local function teleportTo(pos)
+	if typeof(pos) ~= "Vector3" then
+		warn(("[aio] teleportTo dibuang — posisi bukan Vector3 (%s)"):format(typeof(pos)))
+		return
+	end
 	local r = charRoot()
 	if not r then
 		return
@@ -671,7 +677,8 @@ task.spawn(function()
 				PHASE = "POST"
 				lastLog = 0
 			else
-				stepAction(step)
+				-- safe() agar satu error stepAction tidak membunuh loop utama
+				safe(stepAction, step)
 				if now - lastLog > 2 then
 					lastLog = now
 					print(("[aio] TUTORIAL step=%d | Rolls=%d Money=%d"):format(step, rollsNow(), moneyNow()))
