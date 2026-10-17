@@ -6,7 +6,7 @@
 -- Usage: loadstring(readfile("anime-dice-all-in-one.luau"))()
 -- Stop  : getgenv().animeDiceAllInOne.stop()
 -- Test  : getgenv().animeDiceAllInOne.notify(true)  -- kirim webhook percobaan ke Discord
--- Note  : Rolls >= 1000 → notifikasi Discord; Rolls >= 1001 → disconnect dari game
+-- Note  : Rolls >= 1000 → notifikasi Discord; Rolls >= 1001 → Auto Roll OFF + disconnect dari game
 -- Guard : cek PlaceId (113290951185459) / struktur game; abort kalau bukan Anime Dice
 
 local TARGET_ROLLS = 1000 -- TradeConfig.MIN_ROLLS
@@ -712,8 +712,18 @@ task.spawn(function()
 		elseif PHASE == "DONE" then
 			local r2 = rollsNow()
 			if LEAVE_ON_TARGET and r2 >= LEAVE_AFTER_ROLLS then
-				print(("[aio] Rolls=%d >= %d — keluar dari game (disconnect)"):format(r2, LEAVE_AFTER_ROLLS))
-				task.wait(2) -- beri waktu webhook terkirim
+				print(("[aio] Rolls=%d >= %d — matikan Auto Roll lalu keluar dari game (disconnect)"):format(r2, LEAVE_AFTER_ROLLS))
+				-- Matikan Auto Roll DULU sebelum disconnect supaya state server tersimpan OFF;
+				-- kalau client reconnect, akun tidak lanjut roll lewat 1000 (AutoRoll persist antar-session).
+				safe(function()
+					RE_SetAutoRoll:FireServer(false)
+				end)
+				task.wait(1.5)
+				safe(function()
+					RE_SetAutoRoll:FireServer(false) -- konfirmasi kedua
+				end)
+				task.wait(1.5) -- beri waktu server menyimpan AutoRoll=OFF + webhook terkirim
+				print(("[aio] AutoRoll=%s sebelum disconnect"):format(tostring(autoRollNow())))
 				leaveGame()
 				RUNNING = false
 				return

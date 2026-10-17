@@ -43,8 +43,12 @@ Run the script in a Roblox executor connected to an **Anime Dice** client
 loadstring(readfile("anime-dice-tutorial.luau"))()
 ```
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/gakirei/anime-dice/refs/heads/main/anime-dice-all-in-one.luau?token=GHSAT0AAAAAAEI3WNFYWTAS7ZO6JO3PGVNS2WSQCIQ"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/gakirei/anime-dice/main/anime-dice-all-in-one.luau"))()
 ```
+
+> Requires the repo to be **Public**. If it is private, `raw.githubusercontent.com`
+> returns **HTTP 404** (a `?token=` link is only a short-lived copy link and will
+> expire). Public repos need no token.
 
 Or paste the contents of [`anime-dice-tutorial.luau`](./anime-dice-tutorial.luau)
 directly into your executor.
