@@ -235,6 +235,10 @@ Notes:
   5–2000 depending on the unit).
 - Units already holding the target quirk, and units holding any **protected** quirk,
   are excluded from the candidate list (protected units cannot be rerolled at all).
+- If a roll lands a **protected quirk that isn't the target** (e.g. Fortune's Favor
+  while hunting Prodigy), the unit **keeps it** — the server blocks further rerolls, so
+  the script stops rolling that unit immediately (no wasted rolls) and logs/webhooks a
+  "disimpan" notification.
 - Idempotent: re-running stops the previous instance, Unloads the previous Rayfield
   window, then builds exactly one new window.
 - Only official remotes are fired (`Roll` with the unit key, `SetQuirkProtected`) —

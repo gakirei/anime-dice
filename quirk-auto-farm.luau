@@ -16,6 +16,9 @@
 --     sukses terbaca "uang tidak berubah" = penolakan palsu; income pasif juga
 --     mengaburkan arah. Roll sukses yang kebetulan mendarat di quirk SAMA persis
 --     disamarkan jadi penolakan — dibatasi STUCK_LIMIT (0.18^10 ~ 1e-8, aman).
+--     Roll yang mendarat di quirk TERPROTEKSI non-target (mis. Midas Touch atau
+--     Fortune's Favor saat target Prodigy) TIDAK di-reroll: quirk itu tersimpan di
+--     unit tersebut, script langsung pindah unit (0 roll terbuang) + lapor log/webhook.
 -- Odds: Prodigy weight 2 (≈1/2778), Fortune's Favor weight 0.5 (≈1/11112).
 -- Script INI MEMAKAI UANG IN-GAME — AUTO_START = false, start manual saja.
 --
@@ -239,21 +242,34 @@ local function getWebhookUrl()
 	return WEBHOOK_URL
 end
 
--- Notifikasi hit ke Discord (embed ala AIO). Diam-diam dilewati bila URL kosong.
-local function sendWebhook(unitName, quirk)
+-- Notifikasi ke Discord (embed ala AIO). Diam-diam dilewati bila URL kosong.
+-- kept = true -> laporan quirk terproteksi NON-target yang disimpan (bukan hit target).
+local function sendWebhook(unitName, quirk, kept)
 	local url = getWebhookUrl()
 	if type(url) ~= "string" or url == "" then
 		return
+	end
+	local title, description, color
+	if kept then
+		title = "🛡️ " .. quirk .. " disimpan → " .. unitName
+		description = ("**%s**: unit **%s** dapat quirk terproteksi **%s** (non-target) — dipertahankan, lanjut unit berikutnya."):format(
+			tostring(LocalPlayer.Name), unitName, quirk
+		)
+		color = 3066993 -- hijau: quirk langka tersimpan
+	else
+		title = "🎯 " .. quirk .. " → " .. unitName
+		description = ("**%s** mendapat quirk **%s** di unit **%s**."):format(
+			tostring(LocalPlayer.Name), quirk, unitName
+		)
+		color = 15105570 -- ember/orange, sewarna tema window
 	end
 	local payload = {
 		username = "Quirk Farm",
 		embeds = {
 			{
-				title = "🎯 " .. quirk .. " → " .. unitName,
-				description = ("**%s** mendapat quirk **%s** di unit **%s**."):format(
-					tostring(LocalPlayer.Name), quirk, unitName
-				),
-				color = 15105570, -- ember/orange, sewarna tema window
+				title = title,
+				description = description,
+				color = color,
 				fields = {
 					{ name = "Rolls", value = tostring(stats.rolls), inline = true },
 					{ name = "Hits", value = tostring(stats.hits), inline = true },
@@ -394,6 +410,17 @@ local function processCandidate(id, cand)
 			sendWebhook(cand.name, state.targetQuirk)
 			log(string.format("HIT: %s dapat %s (rolls=%d hits=%d)", cand.name, state.targetQuirk, stats.rolls, stats.hits))
 			notify("Quirk Farm", cand.name .. " dapat " .. state.targetQuirk .. "!")
+			return
+		end
+		if isQuirkProtected(quirkNow) then
+			-- Roll mendarat di quirk TERPROTEKSI non-target (mis. Midas Touch /
+			-- Fortune's Favor saat target Prodigy). Server menolak reroll unit yang
+			-- quirk-nya terproteksi (proteksi GLOBAL per nama quirk) -> quirk itu
+			-- AMAN tersimpan di unit ini. Langsung pindah unit: 0 roll terbuang
+			-- (tanpa cek ini, buang STUCK_LIMIT roll dulu sampai menyerah).
+			sendWebhook(cand.name, quirkNow, true)
+			log(string.format("SIMPAN: %s dapat quirk terproteksi non-target %s — unit dilewati, quirk dipertahankan", cand.name, quirkNow))
+			notify("Quirk Farm", cand.name .. " dapat " .. quirkNow .. " (terproteksi, disimpan)")
 			return
 		end
 		if after < before or quirkNow ~= quirkBefore then
