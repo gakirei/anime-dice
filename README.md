@@ -212,7 +212,7 @@ the farm still works via `getgenv().quirkFarm`, just without the window.
 Usage:
 
 ```lua
-loadstring(readfile("quirk-auto-farm.luau"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/gakirei/anime-dice/main/quirk-auto-farm.luau"))()
 ```
 
 Stop / inspect / switch target:
