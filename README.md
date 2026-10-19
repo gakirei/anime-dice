@@ -93,3 +93,72 @@ Usage:
 ```lua
 loadstring(readfile("anime-dice-perf.luau"))()
 ```
+
+## Halloween Auto Candy (Trick-or-Treat)
+
+[`halloween-auto-candy.luau`](./halloween-auto-candy.luau) farms the Halloween event's
+Candy by walking the **7 haunted-house doors on Haunted Island** and knocking on each one
+on a schedule the server accepts.
+
+The knock is server-authoritative — `TrickOrTreatService` re-validates **every 0.2s** and
+silently refuses anything that fails. The script does not fire remotes; it only teleports
+the character and listens for the game's own `Knocked` / `Landed` echoes, so the game's
+client code performs the actual knock. To satisfy validation it encodes all four rules:
+
+| Rule | Server check | What the script does |
+|---|---|---|
+| Range | horizontal (XZ) distance to door `< 14` and `\|dy\| < 20` | stands 4 studs in front, Y pinned to the door |
+| Cooldown | per-door `readyAt = knock + 30s` | waits for server-issued `readyAt` (from the `Knocked` echo) |
+| Gap | `>= max(2s, distToLastKnockedDoor / 60)` across **all** doors | waits out the global gap using `workspace:GetServerTimeNow()` |
+| Re-arm | door disarms on knock, re-arms only when player is `> 17` studs away | stages 19 studs out and dwells there ≥ one server tick |
+
+It discovers doors at runtime via `CollectionService:GetTagged("TrickOrTreatDoor")`
+(nothing is hardcoded), orders them nearest-neighbour from wherever the character stands,
+and teleports with `PivotTo` only — no `WalkSpeed`/`Jump`/noclip changes.
+
+### UI (Rayfield Gen 2)
+
+The script opens a **[Rayfield Gen 2](https://docs.sirius.menu/rayfield-gen2)** window
+(loaded from the official `https://sirius.menu/gen2` loader) with a **Farm** tab:
+
+| Element | What it does |
+|---|---|
+| **Auto Farm Candy** toggle | ON starts the farm (re-discovers doors, recomputes route, reconnects events); OFF stops it — loops exit, events disconnect, stats kept |
+| **Stats** line | live counters: knocks, candy, current route position, next-knock ETA |
+
+Restart happens in-place via the toggle, without re-executing the script. Setup
+failures (not on the island yet, remotes missing, character dead) are recoverable: the
+toggle flips back OFF and the window stays alive, so you can teleport over and retry.
+
+`AUTO_START = true` in the script's config block makes it begin farming on load. Set it
+to `false` if you prefer manual-only start. If Rayfield fails to load (no network /
+HttpGet blocked), the script logs an error and continues **headless** — the farm still
+works via `getgenv().halloweenFarm.{start,stop}`, just without the window.
+
+Measured on `[🎃] Anime Dice` v742: **28 knocks / 117s** (≈14.4 per minute, right at the
+theoretical 7-doors-per-30s cap) for **809 candy**, matching the in-game HUD counter
+exactly. Expect ≈ 17.8 candy/knock on average → roughly **250 candy/min** at steady state.
+
+Notes:
+
+- Listens only — no remotes fired, no memory/state patching.
+- Idempotent: re-running stops the previous instance first, Unloads the previous
+  Rayfield window, then builds exactly one new window (no double loop, no stacked UI).
+- Provides `getgenv().halloweenFarm.{start,stop,stats,isRunning}` (the Rayfield toggle
+  is the intended control surface; the console API is there for scripting/inspection).
+- Requires the character to already be on **Haunted Island** (use the game's
+  `HalloweenService.RF.Teleport` → `"Island"` first).
+- A "Trick!" outcome is purely cosmetic (pumpkin on the head for 20s) — no penalty.
+
+Usage:
+
+```lua
+loadstring(readfile("halloween-auto-candy.luau"))()
+```
+
+Stop / inspect:
+
+```lua
+getgenv().halloweenFarm.stop()
+print(getgenv().halloweenFarm.stats.knocks, getgenv().halloweenFarm.stats.candy)
+```
