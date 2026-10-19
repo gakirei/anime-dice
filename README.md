@@ -162,3 +162,81 @@ Stop / inspect:
 getgenv().halloweenFarm.stop()
 print(getgenv().halloweenFarm.stats.knocks, getgenv().halloweenFarm.stats.candy)
 ```
+
+## Quirk Auto Farm (Prodigy / Fortune's Favor hunter)
+
+[`quirk-auto-farm.luau`](./quirk-auto-farm.luau) spams the **Quirk machine** on your
+**Common-rarity** units until each one lands the chosen target quirk — **Prodigy** or
+**Fortune's Favor** (selectable via dropdown). On a hit it auto-protects the quirk,
+pings a **Discord webhook**, and moves to the next unit.
+
+Odds per roll (total pool weight 5556): **Prodigy = 2/5556 ≈ 1/2778**,
+**Fortune's Favor = 0.5/5556 ≈ 1/11112**. A full rotation over every Common unit is
+expected to take hours — this is an idle farm.
+
+The roll (`QuirkService.RE.Roll`) takes the unit key only and is re-validated by the
+server with a **0.2s debounce** — the script keeps a 0.25s interval. The server
+**silently refuses** rolls (no error, no refund) when:
+
+| Refusal | Server check | Script behavior |
+|---|---|---|
+| Protected quirk | unit's current quirk name is in `ProtectedQuirks` (global per quirk name) | such units are excluded from candidates up front — no wasted rolls |
+| Insufficient funds | money < roll cost | farm stops with a notification |
+| Debounce | last roll < 0.2s ago | interval is always respected |
+
+Success detection is **dual-signal**: a roll succeeded when the unit's quirk string
+**changes**, or money visibly **decreases**. Money comparison alone is unreliable — on
+rich accounts (`~1e17+`) a double's ULP (~64+) is larger than a Common roll cost (~5),
+and passive income muddies the direction, so every success would read as a refusal.
+
+On a hit: fires `SetQuirkProtected(target, true)` once per session (protection is
+global per quirk name, so one fire covers every holder), sends the Discord embed, and
+the unit drops out of the candidate list on the next rotation.
+
+### UI (Rayfield Gen 2)
+
+The script opens a **[Rayfield Gen 2](https://docs.sirius.menu/rayfield-gen2)** window
+(loaded from the official `https://sirius.menu/gen2` loader) with a **Farm** tab:
+
+| Element | What it does |
+|---|---|
+| **Target Quirk** dropdown | `Prodigy` (default) or `Fortune's Favor`; applies from the next rotation |
+| **Auto Farm Quirk** toggle | ON starts, OFF stops — loops exit, stats kept |
+| **Protect on hit** toggle | fires the global quirk protection on the first hit of each session |
+| **Stats** line | rolls, hits, money spent, current unit, target |
+
+`AUTO_START = false` by default (enable in the config block if you want it to begin on
+load). If Rayfield fails to load, the script logs an error and continues **headless** —
+the farm still works via `getgenv().quirkFarm`, just without the window.
+
+Usage:
+
+```lua
+loadstring(readfile("quirk-auto-farm.luau"))()
+```
+
+Stop / inspect / switch target:
+
+```lua
+getgenv().quirkFarm.stop()
+print(getgenv().quirkFarm.stats.rolls, getgenv().quirkFarm.stats.hits)
+getgenv().quirkFarm.setTarget("Fortune's Favor")
+```
+
+Discord webhook: set `WEBHOOK_URL` in the script's config block, or at runtime:
+
+```lua
+getgenv().quirkFarm.webhookUrl = "https://discord.com/api/webhooks/..."
+```
+
+Notes:
+
+- Burns real in-game money — every accepted roll costs (Common roll cost ranges roughly
+  5–2000 depending on the unit).
+- Units already holding the target quirk, and units holding any **protected** quirk,
+  are excluded from the candidate list (protected units cannot be rerolled at all).
+- Idempotent: re-running stops the previous instance, Unloads the previous Rayfield
+  window, then builds exactly one new window.
+- Only official remotes are fired (`Roll` with the unit key, `SetQuirkProtected`) —
+  no force flag, no memory/state patching.
+- Tested against `[🎃] Anime Dice` v746.
