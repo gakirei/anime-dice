@@ -59,6 +59,10 @@ directly into your executor.
 - Idempotent: safe to re-run. Once `OnboardingStep >= 14` it only re-applies the
   post-tutorial settings.
 - Tested against `[🎉UPD 8] Anime Dice`.
+- The trade-ready Discord notification is **off by default** — no webhook is stored in this
+  public repo. Provide one via `getgenv().ANIME_DICE_WEBHOOK = "..."` or a
+  `webhook_url.txt` file in the executor workspace. Without it the script skips the
+  notification and prints a single `OFF` line.
 
 ## Performance (Thermal/Resource Saver)
 
@@ -167,8 +171,27 @@ print(getgenv().halloweenFarm.stats.knocks, getgenv().halloweenFarm.stats.candy)
 
 [`quirk-auto-farm.luau`](./quirk-auto-farm.luau) spams the **Quirk machine** on your
 **Common-rarity** units until each one lands the chosen target quirk — **Prodigy** or
-**Fortune's Favor** (selectable via dropdown). On a hit it auto-protects the quirk,
-pings a **Discord webhook**, and moves to the next unit.
+**Fortune's Favor** (selectable via dropdown). On a hit it pings a **Discord webhook**
+and moves to the next unit.
+
+### Protection model (why units never get stuck)
+
+Quirk protection is **global per quirk name**, not per unit. Protecting a non-target
+quirk makes *every* unit holding it unrollable, which stalls the farm. So the script
+uses **one protected quirk only — the target**:
+
+1. **At start** — fires `SetQuirkProtected(target, true)` and waits for replication
+   (up to 3s) *before* the first roll, so a target can never be rolled away.
+2. **At start** — unprotects every other quirk with `weight < 100` (Fortune's Favor,
+   Midas Touch, Tycoon, Sovereign, …) so those units become rollable again. The original
+   protection map is snapshotted and **restored on stop**.
+3. **Blacklist** — units that *already* hold a rare quirk (`weight < 100`) at start are
+   recorded **per unit key** and skipped for the whole session, so existing rare
+   inventory is never rerolled. Default ON (`BLACKLIST_RARE_UNITS`), toggleable in the UI,
+   rebuilt automatically on start / on target change.
+4. **During the run** — a rare quirk that is *not* the target is **not** kept: the unit
+   keeps being rolled (that's the "only hold the chosen quirk" rule). Each one is logged
+   and counted as `rareLost`.
 
 Odds per roll (total pool weight 5556): **Prodigy = 2/5556 ≈ 1/2778**,
 **Fortune's Favor = 0.5/5556 ≈ 1/11112**. A full rotation over every Common unit is
@@ -180,18 +203,19 @@ server with a **0.2s debounce** — the script keeps a 0.25s interval. The serve
 
 | Refusal | Server check | Script behavior |
 |---|---|---|
-| Protected quirk | unit's current quirk name is in `ProtectedQuirks` (global per quirk name) | such units are excluded from candidates up front — no wasted rolls |
+| Protected quirk | unit's current quirk name is in `ProtectedQuirks` (global per quirk name) | only the target stays protected, so target holders are excluded and every other unit stays rollable |
+| Out of range | `AntiCheatService.IsNearZone(player, "Quirks")` | a full rotation with zero accepted rolls auto-stops the farm with a notification (no infinite spin) |
 | Insufficient funds | money < roll cost | farm stops with a notification |
 | Debounce | last roll < 0.2s ago | interval is always respected |
 
 Success detection is **dual-signal**: a roll succeeded when the unit's quirk string
 **changes**, or money visibly **decreases**. Money comparison alone is unreliable — on
-rich accounts (`~1e17+`) a double's ULP (~64+) is larger than a Common roll cost (~5),
-and passive income muddies the direction, so every success would read as a refusal.
+rich accounts (`~1e26`) a double's ULP is far larger than a Common roll cost (~5), and
+passive income muddies the direction, so every success would read as a refusal.
 
-On a hit: fires `SetQuirkProtected(target, true)` once per session (protection is
-global per quirk name, so one fire covers every holder), sends the Discord embed, and
-the unit drops out of the candidate list on the next rotation.
+On a hit: the unit is dropped from the candidate list (target is already protected since
+start), the Discord embed fires, and the loop moves to the next unit. `stop()` restores
+the protection map captured at start, leaving the target protected.
 
 ### UI (Rayfield Gen 2)
 
@@ -200,10 +224,10 @@ The script opens a **[Rayfield Gen 2](https://docs.sirius.menu/rayfield-gen2)** 
 
 | Element | What it does |
 |---|---|
-| **Target Quirk** dropdown | `Prodigy` (default) or `Fortune's Favor`; applies from the next rotation |
-| **Auto Farm Quirk** toggle | ON starts, OFF stops — loops exit, stats kept |
-| **Protect on hit** toggle | fires the global quirk protection on the first hit of each session |
-| **Stats** line | rolls, hits, money spent, current unit, target |
+| **Target Quirk** dropdown | `Prodigy` (default) or `Fortune's Favor`; re-applies protections + blacklist immediately when switched while running |
+| **Auto Farm Quirk** toggle | ON starts (protect target → blacklist → roll), OFF stops and restores the old protection map |
+| **Blacklist unit langka** toggle | ON = units already holding a rare quirk (`weight < 100`) at start are skipped for the whole session |
+| **Stats** | 3 lines: `rolls · accepted · hits` / `rare dibuang · money spent` / `current unit · target` |
 
 `AUTO_START = false` by default (enable in the config block if you want it to begin on
 load). If Rayfield fails to load, the script logs an error and continues **headless** —
@@ -219,28 +243,96 @@ Stop / inspect / switch target:
 
 ```lua
 getgenv().quirkFarm.stop()
-print(getgenv().quirkFarm.stats.rolls, getgenv().quirkFarm.stats.hits)
+print(getgenv().quirkFarm.stats.rolls, getgenv().quirkFarm.stats.hits, getgenv().quirkFarm.stats.rareLost)
 getgenv().quirkFarm.setTarget("Fortune's Favor")
+getgenv().quirkFarm.rebuildBlacklist()
 ```
 
-Discord webhook: set `WEBHOOK_URL` in the script's config block, or at runtime:
+Discord webhook: **nothing is hardcoded** (the repo is public). The URL is resolved in this
+order — first non-empty wins:
+
+1. the **Webhook URL** field in the dashboard card (sent through the remote config),
+2. `getgenv().quirkFarm.webhookUrl` at runtime,
+3. `getgenv().QUIRK_WEBHOOK` set before loading the script,
+4. a `webhook_url.txt` file in the executor workspace.
 
 ```lua
 getgenv().quirkFarm.webhookUrl = "https://discord.com/api/webhooks/..."
 ```
 
+With no webhook, the farm runs normally and Discord is simply skipped (one `OFF` line in
+the console). The URL is never logged and never written to disk by the script.
+
 Notes:
 
 - Burns real in-game money — every accepted roll costs (Common roll cost ranges roughly
   5–2000 depending on the unit).
-- Units already holding the target quirk, and units holding any **protected** quirk,
-  are excluded from the candidate list (protected units cannot be rerolled at all).
-- If a roll lands a **protected quirk that isn't the target** (e.g. Fortune's Favor
-  while hunting Prodigy), the unit **keeps it** — the server blocks further rerolls, so
-  the script stops rolling that unit immediately (no wasted rolls) and logs/webhooks a
-  "disimpan" notification.
+- Keep your character near the **Quirk machine** while farming. Rolls are accepted from a
+  fairly loose range (verified ~31 studs from the zone center), but if the server stops
+  accepting them the farm auto-stops after one empty rotation instead of spinning.
+- Units already holding the **target** quirk are excluded from candidates. Units holding a
+  rare quirk are excluded too *while the blacklist is on* — with it off, their quirk can
+  be rerolled away.
+- A rare quirk that isn't the target (e.g. Fortune's Favor while hunting Prodigy) is
+  **not kept** — it is logged/webhooked as "rare dibuang" and the unit keeps rolling.
+  This is deliberate: protecting a non-target quirk globally would stall every holder.
+- On stop, the protection map from start is restored (the target stays protected), so
+  other rare quirks return to whatever state they had before the session.
 - Idempotent: re-running stops the previous instance, Unloads the previous Rayfield
   window, then builds exactly one new window.
 - Only official remotes are fired (`Roll` with the unit key, `SetQuirkProtected`) —
   no force flag, no memory/state patching.
-- Tested against `[🎃] Anime Dice` v746.
+- Tested against `[🎃] Anime Dice` v803.
+
+### Remote control from the web dashboard (optional)
+
+The farm can be driven from the [`web/`](./web) dashboard instead of the Rayfield
+window: settings are stored in Supabase, **Start/Stop** is a button in the browser, and
+the script streams live stats back.
+
+**Off by default.** `SYNC_KEY = ""` means pure local mode — no timers, no HTTP calls,
+exactly the behaviour described above. To enable it:
+
+1. Run the migration `web/supabase/migrations/20261026000000_quirk_control.sql` in the
+   Supabase SQL editor (idempotent).
+2. Deploy the edge function: `supabase functions deploy quirk --no-verify-jwt`
+   (or paste `web/supabase/functions/quirk/index.ts` in the dashboard and disable JWT
+   verification). Full steps: [`web/supabase/README.md`](./web/supabase/README.md).
+3. Give the script your sync key from the dashboard's **Sync key** panel — **without
+   committing it**. Any of these works, checked in this order:
+   - `getgenv().QUIRK_SYNC_KEY = "..."` set before loading the script,
+   - `REMOTE_CONFIG.SYNC_KEY` in the config block (local/private copies only),
+   - a `quirk_sync_key.txt` file in the executor workspace (recommended — works even
+     when the script itself is loaded from the raw GitHub URL).
+
+   Then re-run the script: the console shows `remote config: ON (poll 15s)`. With no key
+   it stays `OFF (sync key kosong)` and nothing is sent. The key is never logged.
+4. **Save the settings once** in the dashboard. That creates the `quirk_controls` row and
+   bumps `rev`; a pull against a missing row returns `config: null` and changes nothing.
+5. Open the account's detail page in the dashboard — the **Quirk Farm** card shows the
+   same settings as the in-game window (target, blacklist, roll interval, stuck limit,
+   webhook URL) plus **Start/Stop** and the live counters (updates within ~15s for config,
+   ~30s for stats).
+
+How it works:
+
+| Direction | Path | Cadence |
+|---|---|---|
+| Browser → Supabase | direct PostgREST write to `public.quirk_controls.config` (RLS: `owner_id = auth.uid()`) | on save / on toggle (`rev` bumps) |
+| Script → Supabase | `POST /functions/v1/quirk` `{action:"pull"}`, `x-sync-key` | every 15s, applies only when `rev` changed |
+| Script → Supabase | `POST /functions/v1/quirk` `{action:"status"}`, `x-sync-key` | every 30s |
+| Supabase → Browser | realtime on `quirk_controls` (polling fallback) | live |
+
+Notes:
+
+- The dashboard **never** rolls anything itself — it only writes config. The script
+  remains the only actor that fires game remotes, so a stale browser tab cannot roll.
+- `Start`/`Stop` from the web behaves exactly like the Rayfield toggle (protections are
+  applied on start, restored on stop).
+- Local UI still works while remote mode is on; the last applied remote `rev` wins on the
+  next pull.
+- The function authenticates with the sync key only and writes **status** only — it never
+  accepts config writes, so a leaked sync key cannot change your settings.
+- Status is a fixed 13-key whitelist (`running`, `target`, `rolls`, `accepted`, `hits`,
+  `rareLost`, `moneySpent`, `current`, `candidates`, `blacklisted`, `appliedRev`,
+  `lastSeenAt`, `version`); anything else is dropped server-side.

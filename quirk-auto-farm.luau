@@ -1,52 +1,77 @@
 --// Anime Dice — Quirk Auto Farm (Prodigy / Fortune's Favor hunter) \\--
 -- Me-roll mesin Quirk di unit Common milik player sampai tiap unit mendapat
--- quirk target (Prodigy atau Fortune's Favor), lalu melindunginya sekali per
--- sesi dan melanjut ke unit berikutnya. Server QUIRKSERVICE:
+-- quirk target (Prodigy atau Fortune's Favor). Server QUIRKSERVICE:
 --   • Roll: Network.QuirkService.RE.Roll — FireServer(unitKey) SAJA.
 --     Argumen kedua (force=true) melewati proteksi — DILARANG dipakai script ini.
---   • Proteksi: Network.QuirkService.RE.SetQuirkProtected — FireServer(quirk, true).
---     Server hanya menerima quirk dengan config weight < 100 (kedua target lolos).
+--   • Proteksi: Network.QuirkService.RE.SetQuirkProtected — FireServer(quirk, bool).
+--     Server hanya menerima quirk dengan config weight < 100. Proteksi bersifat
+--     GLOBAL per NAMA quirk dan tersimpan di profile — bukan per unit, dan TIDAK
+--     mempengaruhi odds roll (LuckyWeights.Roll tidak melihat daftar proteksi).
 --   • Debounce server 0.2s per pemain -> interval client ROLL_INTERVAL = 0.25s.
 --   • Server MENOLAK DIAM-DIAM (tanpa error) bila: quirk unit sedang diproteksi
---     (proteksi GLOBAL per nama quirk — melindungi "Prodigy" memblokir reroll di
---     unit mana pun yang sedang memegang Prodigy), uang kurang, atau kena debounce.
---     Deteksi penolakan di client (dual-signal): roll sukses = quirk unit BERUBAH
---     atau uang turun yang terlihat. Money-compare SAJA tidak cukup — di akun kaya
---     (magnitude 1e17+) ULP double ~64 sedangkan roll cost Common ~5, jadi roll
---     sukses terbaca "uang tidak berubah" = penolakan palsu; income pasif juga
---     mengaburkan arah. Roll sukses yang kebetulan mendarat di quirk SAMA persis
---     disamarkan jadi penolakan — dibatasi STUCK_LIMIT (0.18^10 ~ 1e-8, aman).
---     Roll yang mendarat di quirk TERPROTEKSI non-target (mis. Midas Touch atau
---     Fortune's Favor saat target Prodigy) TIDAK di-reroll: quirk itu tersimpan di
---     unit tersebut, script langsung pindah unit (0 roll terbuang) + lapor log/webhook.
+--     (butuh arg force), uang kurang, kena debounce, atau pemain TIDAK berada di
+--     zona "Quirks" (AntiCheatService.IsNearZone). Semua roll ditolak = tidak ada
+--     yang berubah -> dideteksi oleh guard "rotasi tanpa roll diterima".
+--
+--// Kebijakan proteksi (PENTING) \\--
+-- HANYA quirk target yang ditahan. Saat start:
+--   1. Semua quirk langka lain (weight < 100: Midas Touch, Fortune's Favor,
+--      Sovereign, Tycoon) DILEPAS proteksinya, supaya unit yang kebetulan
+--      mendarat di sana bisa di-reroll lagi — unit tidak "nyangkut" memegang
+--      quirk non-target.
+--   2. Quirk target justru DIPROTEKSI SEBELUM roll pertama, jadi begitu mendarat
+--      langsung terkunci (tidak ada window 0.25s antara hit dan protect).
+--   3. Inventori lama diselamatkan lewat BLACKLIST PER UNIT KEY: setiap unit yang
+--      sudah memegang quirk langka (weight < 100) selain target tidak pernah
+--      dijadikan kandidat, walau proteksi nama quirk-nya dilepas.
+-- Saat stop, snapshot proteksi awal dipulihkan (target tetap terkunci).
+-- Konsekuensi yang diterima: quirk langka non-target yang MENDARAT SELAMA FARM
+-- akan di-reroll dan hilang (dihitung di stats.rareLost + log).
+--
 -- Odds: Prodigy weight 2 (≈1/2778), Fortune's Favor weight 0.5 (≈1/11112).
 -- Script INI MEMAKAI UANG IN-GAME — AUTO_START = false, start manual saja.
 --
 -- Usage : loadstring(readfile("quirk-auto-farm.luau"))()
 -- UI    : Rayfield Gen 2 (dependensi: https://sirius.menu/gen2) — SATU window
 --           "Quirk Auto Farm" berisi dropdown target, toggle Auto Farm Quirk,
---           toggle Protect on hit, dan Stats. Toggle ON = start, OFF = stop.
+--           toggle Blacklist unit langka, dan Stats. Toggle ON = start, OFF = stop.
 --           AUTO_START = false: tidak jalan otomatis saat load.
 --           Bila load Rayfield gagal (tanpa HttpGet / tanpa jaringan) script
 --           TETAP jalan tanpa UI (headless) — kontrol via API di bawah.
--- API   : getgenv().quirkFarm = { stats, start, stop, isRunning, setTarget }
---             stats          -- { rolls, hits, moneySpent } — akumulatif
+-- API   : getgenv().quirkFarm = { stats, start, stop, isRunning, setTarget,
+--             blacklist, rebuildBlacklist, webhookUrl }
+--             stats          -- { rolls, accepted, hits, rareLost, moneySpent } akumulatif
 --             start()        -- true = berjalan, false = gagal (recoverable)
---             stop()         -- hentikan loop generasi sekarang
+--             stop()         -- hentikan loop + pulihkan snapshot proteksi
 --             isRunning()    -- status running sekarang
---             setTarget(name)-- "Prodigy" | "Fortune's Favor"; berlaku rotasi berikutnya
--- Idempotent: re-running stops the previous instance first, unloads the previous
--- Rayfield window, then builds exactly one new window — no stacked windows, no
--- double loops. Lifecycle memakai generation token (runId): setiap start/stop
--- menaikkan runId, semua loop membawa id generasinya dan keluar saat id ~= runId.
+--             setTarget(name)-- "Prodigy" | "Fortune's Favor"; proteksi + blacklist
+--                               langsung diterapkan ulang bila sedang berjalan
+--             blacklist      -- set unitKey -> true (unit yang tidak boleh di-reroll)
+--             rebuildBlacklist() -- hitung ulang blacklist dari inventori sekarang
+--             pullConfig()   -- tarik config dari dashboard sekarang (true, code | false, err)
+--             pushStatus()   -- kirim status ke dashboard sekarang
+--             remote         -- { enabled, keySet, lastError, lastPullAt, appliedRev }
+-- Remote : sync key diambil dari getgenv().QUIRK_SYNC_KEY, lalu REMOTE_CONFIG.SYNC_KEY,
+--          lalu file "quirk_sync_key.txt" (readfile). Kosong semua = mode lokal murni.
+--          Key tidak pernah di-log dan tidak pernah ditulis ke disk oleh script ini.
+-- Idempotent: re-running stops the previous instance first (yang juga memulihkan
+-- proteksi), unloads the previous Rayfield window, then builds exactly one new
+-- window — no stacked windows, no double loops. Lifecycle memakai generation
+-- token (runId): setiap start/stop menaikkan runId, semua loop membawa id
+-- generasinya dan keluar saat id ~= runId.
 
 --// Teardown instance lama — urutan di bawah WAJIB urut (window/loop bocor kalau tidak) \\--
 local ENV = (type(getgenv) == "function") and getgenv() or _G
 
--- (1) Hentikan farm generasi lama dulu -> re-run = ganti, bukan menumpuk loop.
+-- (1) Hentikan farm generasi lama dulu -> stop() juga memulihkan proteksi yang
+--     sempat diubah generasi itu, jadi re-run tidak meninggalkan state aneh.
 if type(ENV.quirkFarm) == "table" and type(ENV.quirkFarm.stop) == "function" then
 	pcall(ENV.quirkFarm.stop)
 end
+
+-- (1a) Loop remote generasi lama (bila ada) keluar lewat generation token —
+-- stop() tidak menyentuhnya, jadi tanpa ini re-run bisa meninggalkan poller kedua.
+ENV.__quirkFarmRemoteGen = (tonumber(ENV.__quirkFarmRemoteGen) or 0) + 1
 
 -- (2) Tutup window Rayfield generasi lama (handle disimpan di ENV saat build).
 do
@@ -66,22 +91,100 @@ local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 
 --// Config \\--
-local AUTO_START = false -- script MEMAKAI uang in-game: jangan start otomatis; user nyalakan manual lewat toggle/API
+local AUTO_START = false -- script MEMAKAI uang in-game: jangan start otomatis
 local ROLL_INTERVAL = 0.25 -- server debounce 0.2s per pemain -> 0.25s ambang aman
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1422109131006808156/FzTcL84FAs4hfeBXUXnEad0RQrWXiVzd8bZwlqnc2IKq-W1zVZVFIhP66IPJi1yuhkR8" -- URL Discord webhook; bisa dioverride runtime via getgenv().quirkFarm.webhookUrl
+local WEBHOOK_URL = "" -- JANGAN hardcode: isi dari dashboard (card Quirk Farm), getgenv().QUIRK_WEBHOOK, atau file "webhook_url.txt"
+-- Urutan sumber webhook: config dashboard -> getgenv().quirkFarm.webhookUrl ->
+-- getgenv().QUIRK_WEBHOOK -> file "webhook_url.txt". Kosong semua = tanpa notifikasi
+-- (farm tetap jalan, hanya Discord yang dilewati). URL tidak pernah di-log.
+do
+	local function trimHook(value)
+		return (tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+	local candidate = ENV.QUIRK_WEBHOOK
+	if type(candidate) ~= "string" or trimHook(candidate) == "" then
+		candidate = WEBHOOK_URL
+	end
+	if trimHook(candidate) == "" and type(readfile) == "function" then
+		local ok, data = pcall(readfile, "webhook_url.txt")
+		if ok and type(data) == "string" then
+			candidate = data
+		end
+	end
+	WEBHOOK_URL = trimHook(candidate)
+end
 local STUCK_LIMIT = 10 -- ambigu berturut-turut (quirk tak berubah + uang tak turun) sebelum unit dilewati; 10 menutup roll sukses yang kebetulan mendarat di quirk sama (~0.18^10)
+local PROTECT_SETTLE_TIMEOUT = 3 -- detik menunggu replikasi SetQuirkProtected dikonfirmasi client
+local BLACKLIST_RARE_UNITS = true -- blacklist unit lama yang sudah pegang quirk langka (weight < 100) selain target
+
+--// Remote config (Supabase edge function) — opsional \\--
+-- SYNC_KEY kosong = mode lokal: tidak ada timer/HTTP, perilaku persis seperti
+-- sebelumnya. Isi key dari dashboard; JANGAN pernah hardcode key asli di sini.
+local REMOTE_CONFIG = {
+	ENABLED      = true,
+	URL          = "https://rlbmftsefonfdqfhyjij.supabase.co/functions/v1/quirk",
+	SYNC_KEY     = "",   -- empty = disabled (local-only mode); fill from the dashboard
+	POLL         = 15,   -- seconds between config pulls
+	STATUS_EVERY = 30,   -- seconds between status pushes
+}
+
+--// Sync key resolution (key TIDAK pernah di-log / ditulis ke disk) \\--
+-- Urutan: getgenv().QUIRK_SYNC_KEY -> REMOTE_CONFIG.SYNC_KEY -> file "quirk_sync_key.txt".
+-- Tujuannya: key bisa disimpan di LUAR file ini, jadi aman walau script di-load dari
+-- raw GitHub URL (jangan pernah commit key asli ke repo publik).
+local SYNC_KEY = ""
+do
+	local function trimKey(value)
+		return (tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+	local sources = {
+		function() -- 1. runtime override, diset sebelum load / dari executor console
+			local value = ENV.QUIRK_SYNC_KEY
+			return type(value) == "string" and value or nil
+		end,
+		function() -- 2. konstanta di file (hanya untuk pemakaian lokal/private)
+			return REMOTE_CONFIG.SYNC_KEY
+		end,
+		function() -- 3. file teks di workspace executor
+			if type(readfile) ~= "function" then
+				return nil
+			end
+			local ok, data = pcall(readfile, "quirk_sync_key.txt")
+			return (ok and type(data) == "string") and data or nil
+		end,
+	}
+	for _, read in ipairs(sources) do
+		local ok, value = pcall(read)
+		local key = ok and trimKey(value) or ""
+		if key ~= "" then
+			SYNC_KEY = key
+			break
+		end
+	end
+end
 
 --// State \\--
 local state = {
 	running = false,
-	targetQuirk = "Prodigy", -- diganti lewat dropdown / setTarget(); berlaku rotasi kandidat berikutnya
-	protectOnHit = true, -- lindungi quirk target sekali per sesi begitu dapat
-	protectedOnce = false, -- guard: SetQuirkProtected hanya ditembak SATU kali per sesi
+	targetQuirk = "Prodigy", -- diganti lewat dropdown / setTarget()
+	currentLabel = nil, -- unit yang sedang diproses (dilaporkan ke dashboard)
+	candidateCount = 0, -- jumlah kandidat rotasi terakhir
+	selfProtected = {}, -- nama quirk yang proteksinya KITA nyalakan -> tetap protected setelah stop
+	blacklistRare = BLACKLIST_RARE_UNITS, -- dicerminkan dari toggle UI / config remote
+	rollInterval = ROLL_INTERVAL, -- live: prosesCandidate membaca ini tiap wait
+	stuckLimit = STUCK_LIMIT, -- live: ambang unit dianggap stuck
+	webhookUrl = "", -- override runtime (remote); kosong = pakai WEBHOOK_URL
+	appliedRev = 0, -- rev config remote terakhir yang sudah diterapkan
+	remote = { enabled = false, keySet = false, lastError = nil, lastPullAt = 0, appliedRev = 0 },
 }
 local runId = 0 -- generation token: tiap start/stop naik 1 -> loop generasi lama mati bersih
-local stats = { rolls = 0, hits = 0, moneySpent = 0 } -- akumulatif lintas stop/start (tidak pernah di-reset)
-local DC -- DataController hasil require (di-resolve ulang tiap start; nil = belum/belum berhasil)
-local RollRE, ProtectRE -- remote QuirkService (di-resolve ulang tiap start; nil = belum)
+local stats = { rolls = 0, accepted = 0, hits = 0, rareLost = 0, moneySpent = 0 } -- akumulatif lintas stop/start
+local blacklist = {} -- unitKey -> true: unit yang TIDAK boleh di-reroll (inventori lama)
+state.blacklist = blacklist -- referensi sama, dipakai untuk hitung status remote
+local protectionSnapshot -- name -> bool, diambil saat start dan dipulihkan saat stop
+local DC -- DataController hasil require
+local RollRE, ProtectRE -- remote QuirkService
+local QuirksConfig -- cache require config Quirks
 local stop -- forward-declare: mainLoop memanggil stop() sebelum definisinya di bawah
 
 --// Rayfield Gen 2 handles — dibuat sekali di jalur load; semuanya nil = tanpa UI \\--
@@ -112,9 +215,9 @@ local function readMoney()
 	return nil
 end
 
--- Quirk unit: entry.attributes.quirk adalah STRING (atau nil bila belum punya).
--- Diverifikasi live: memanggilnya sebagai function error "attempt to call a string
--- value". Tetap dukung bentuk callable Value kalau game membungkusnya di versi lain.
+-- Quirk unit: entry.attributes.quirk adalah STRING live (tabel reaktif ditulis
+-- in-place oleh replikasi), bukan snapshot basi. Tetap dukung bentuk callable
+-- Value kalau game membungkusnya di versi lain.
 local function readQuirk(entry)
 	local ok, v = pcall(function()
 		local q = entry.attributes.quirk
@@ -129,15 +232,181 @@ local function readQuirk(entry)
 	return nil
 end
 
+-- Config Quirks (weight tiap nama) — dipakai untuk batas "langka" = weight < 100,
+-- sama persis dengan syarat server pada SetQuirkProtected.
+local function getQuirks()
+	if QuirksConfig then
+		return QuirksConfig
+	end
+	local ok, mod = pcall(function()
+		return require(RS.Framework.Features.Quirks.Quirks)
+	end)
+	if ok and type(mod) == "table" then
+		QuirksConfig = mod
+		return mod
+	end
+	return nil
+end
+
+local function isRareQuirk(name)
+	local quirks = getQuirks()
+	local cfg = (quirks and name) and quirks[name] or nil
+	return type(cfg) == "table" and type(cfg.weight) == "number" and cfg.weight < 100
+end
+
+-- Map proteksi global (nama quirk -> boolean) dibaca live dari data client.
+local function protectedMap()
+	local ok, map = pcall(function()
+		return DC.ProtectedQuirks()
+	end)
+	if ok and type(map) == "table" then
+		return map
+	end
+	return {}
+end
+
+local function isProtected(name)
+	if name == nil then
+		return false
+	end
+	local v = protectedMap()[name]
+	if type(v) == "function" then
+		local ok, r = pcall(v)
+		return ok and r == true
+	end
+	return v == true
+end
+
+local function fireProtect(name, desired)
+	pcall(function()
+		ProtectRE:FireServer(name, desired == true)
+	end)
+end
+
+--// Proteksi: snapshot / terapkan / pulihkan \\--
+local function snapshotProtections()
+	local snap = {}
+	for name, v in pairs(protectedMap()) do
+		local value = v
+		if type(v) == "function" then
+			local ok, r = pcall(v)
+			value = ok and r or false
+		end
+		snap[name] = value == true
+	end
+	return snap
+end
+
+-- Terapkan kebijakan: target = protected, semua quirk langka lain = UNPROTECTED.
+-- Menunggu konfirmasi replikasi supaya tidak lanjut roll dengan state proteksi
+-- yang belum sinkron (roll-nya akan ditolak server).
+local function applyProtections(target)
+	local quirks = getQuirks()
+	if not quirks then
+		log("WARN: config Quirks tidak terbaca — proteksi tidak diubah")
+		return false
+	end
+
+	local desired = {}
+	for name, cfg in pairs(quirks) do
+		if type(cfg) == "table" and type(cfg.weight) == "number" and cfg.weight < 100 then
+			desired[name] = (name == target)
+		end
+	end
+	desired[target] = true
+
+	for name, want in pairs(desired) do
+		if isProtected(name) ~= want then
+			fireProtect(name, want)
+			if want then
+				state.selfProtected[name] = true
+			end
+			log(string.format("proteksi %s -> %s", name, tostring(want)))
+			task.wait(0.05)
+		elseif want then
+			state.selfProtected[name] = true
+		end
+	end
+
+	local deadline = os.clock() + PROTECT_SETTLE_TIMEOUT
+	while os.clock() < deadline do
+		local allOk = true
+		for name, want in pairs(desired) do
+			if isProtected(name) ~= want then
+				allOk = false
+				break
+			end
+		end
+		if allOk then
+			return true
+		end
+		task.wait(0.1)
+	end
+
+	for name, want in pairs(desired) do
+		if isProtected(name) ~= want then
+			log(string.format("WARN: proteksi %s tidak terkonfirmasi (harus %s)", name, tostring(want)))
+		end
+	end
+	return false
+end
+
+-- Pulihkan snapshot proteksi awal. Quirk yang proteksinya KITA nyalakan tetap
+-- protected (target hasil farm tidak boleh ikut dilepas).
+local function restoreProtections()
+	local snap = protectionSnapshot
+	protectionSnapshot = nil
+	if type(snap) ~= "table" then
+		return
+	end
+	for name, wasProtected in pairs(snap) do
+		local desired = state.selfProtected[name] or wasProtected
+		if isProtected(name) ~= desired then
+			fireProtect(name, desired)
+			task.wait(0.05)
+		end
+	end
+	local target = state.targetQuirk
+	if not isProtected(target) then
+		fireProtect(target, true)
+	end
+	log("proteksi dipulihkan")
+end
+
+--// Blacklist per unit \\--
+-- Unit yang SUDAH memegang quirk langka (weight < 100) selain target tidak pernah
+-- dijadikan kandidat, jadi proteksi nama quirk-nya aman dilepas tanpa kehilangan
+-- inventori lama. Dihitung ulang saat start / ganti target / toggle blacklist.
+local function rebuildBlacklist()
+	table.clear(blacklist)
+	if not state.blacklistRare then
+		return 0
+	end
+	local okInv, inventory = pcall(function()
+		return DC.Inventory()
+	end)
+	if not okInv or type(inventory) ~= "table" then
+		return 0
+	end
+	local count = 0
+	for key, entry in pairs(inventory) do
+		local quirk = readQuirk(entry)
+		if quirk ~= nil and quirk ~= state.targetQuirk and isRareQuirk(quirk) then
+			blacklist[key] = true
+			count += 1
+		end
+	end
+	return count
+end
+
 --// Stats UI sink \\--
--- Update elemen Stats di window Rayfield. pcall karena window bisa saja sudah
--- di-Unload (re-run / user tutup) atau UI memang tidak pernah ter-build.
 local function updateStatsText(unitLabel)
+	state.currentLabel = unitLabel or state.currentLabel
 	pcall(function()
 		if statsText then
 			statsText:Set(string.format(
-				"rolls: %d · hits: %d · money spent: %d\ncurrent: %s · target: %s",
-				stats.rolls, stats.hits, stats.moneySpent,
+				"rolls: %d · accepted: %d · hits: %d\nrare dibuang: %d · money spent: %d\ncurrent: %s · target: %s",
+				stats.rolls, stats.accepted, stats.hits, stats.rareLost, stats.moneySpent,
 				unitLabel or "-", state.targetQuirk
 			))
 		end
@@ -151,7 +420,6 @@ end
 
 -- Refleksi state ke toggle Rayfield TANPA callback: Set(v, true) = skip callback,
 -- jadi stop()/start() tidak pernah saling re-enter lewat UI (anti-recursion).
--- No-op bila Rayfield gagal dimuat (farmToggle nil) -> mode headless tetap jalan.
 local function syncToggle(desiredRunning)
 	if not farmToggle then
 		return
@@ -232,9 +500,10 @@ local function httpPost(url, payload)
 	return false, tostring(lastErr)
 end
 
--- URL webhook: override runtime via getgenv().quirkFarm.webhookUrl mengalahkan
--- konfigurasi statis WEBHOOK_URL.
 local function getWebhookUrl()
+	if type(state.webhookUrl) == "string" and state.webhookUrl ~= "" then
+		return state.webhookUrl
+	end
 	local api = ENV.quirkFarm
 	if type(api) == "table" and type(api.webhookUrl) == "string" and api.webhookUrl ~= "" then
 		return api.webhookUrl
@@ -242,37 +511,26 @@ local function getWebhookUrl()
 	return WEBHOOK_URL
 end
 
--- Notifikasi ke Discord (embed ala AIO). Diam-diam dilewati bila URL kosong.
--- kept = true -> laporan quirk terproteksi NON-target yang disimpan (bukan hit target).
-local function sendWebhook(unitName, quirk, kept)
+-- Notifikasi Discord untuk HIT target saja (rare yang dibuang cukup di log —
+-- tidak di-webhook supaya tidak spam saat farming panjang).
+local function sendWebhook(unitName, quirk)
 	local url = getWebhookUrl()
 	if type(url) ~= "string" or url == "" then
 		return
-	end
-	local title, description, color
-	if kept then
-		title = "🛡️ " .. quirk .. " disimpan → " .. unitName
-		description = ("**%s**: unit **%s** dapat quirk terproteksi **%s** (non-target) — dipertahankan, lanjut unit berikutnya."):format(
-			tostring(LocalPlayer.Name), unitName, quirk
-		)
-		color = 3066993 -- hijau: quirk langka tersimpan
-	else
-		title = "🎯 " .. quirk .. " → " .. unitName
-		description = ("**%s** mendapat quirk **%s** di unit **%s**."):format(
-			tostring(LocalPlayer.Name), quirk, unitName
-		)
-		color = 15105570 -- ember/orange, sewarna tema window
 	end
 	local payload = {
 		username = "Quirk Farm",
 		embeds = {
 			{
-				title = title,
-				description = description,
-				color = color,
+				title = "🎯 " .. quirk .. " → " .. unitName,
+				description = ("**%s** mendapat quirk **%s** di unit **%s** (langsung diproteksi)."):format(
+					tostring(LocalPlayer.Name), quirk, unitName
+				),
+				color = 15105570, -- ember/orange, sewarna tema window
 				fields = {
 					{ name = "Rolls", value = tostring(stats.rolls), inline = true },
 					{ name = "Hits", value = tostring(stats.hits), inline = true },
+					{ name = "Rare dibuang", value = tostring(stats.rareLost), inline = true },
 					{ name = "Money spent", value = tostring(stats.moneySpent), inline = true },
 					{ name = "Time", value = os.date("!%H:%M:%S UTC"), inline = true },
 				},
@@ -284,32 +542,14 @@ local function sendWebhook(unitName, quirk, kept)
 	log("discord webhook " .. (ok and "OK" or "GAGAL") .. ": " .. tostring(info))
 end
 
--- Cek apakah quirk sedang diproteksi (GLOBAL per nama quirk, dibaca dari data
--- client). Unit yang memegang quirk terproteksi tidak bisa di-reroll server-side
--- (QuirkService menolak diam-diam), jadi tidak perlu dijadikan kandidat.
--- Bentuk API terverifikasi live: DC.ProtectedQuirks() -> map nama -> Value callable.
-local function isQuirkProtected(quirk)
-	if quirk == nil then
-		return false
-	end
-	local ok, v = pcall(function()
-		local map = DC and DC.ProtectedQuirks and DC.ProtectedQuirks()
-		local value = map and map[quirk]
-		if type(value) == "function" then
-			return value()
-		end
-		return value
-	end)
-	return ok and v == true
-end
-
 --// Farm loop \\--
--- Snapshot inventory -> filter unit Common yang quirknya BELUM target.
--- Dipanggil ulang tiap rotasi penuh: ganti target lewat dropdown berlaku di sini,
--- unit yang sudah dapat target otomatis gugur dari daftar.
+-- Snapshot inventory -> filter unit Common yang quirknya BELUM target, tidak
+-- di-blacklist, dan tidak sedang memegang quirk terproteksi (target holders
+-- otomatis gugur lewat perbandingan quirk).
 local function computeCandidates(id)
 	local candidates = {}
-	local protectedSkipped = 0
+	state.candidateCount = 0
+	local skippedBlack, skippedProtected = 0, 0
 	local okInv, inventory = pcall(function()
 		return DC.Inventory()
 	end)
@@ -329,12 +569,13 @@ local function computeCandidates(id)
 			if entryConfig.kind == "Unit" and entryConfig.rarity == "Common" then
 				local quirk = readQuirk(entry)
 				if quirk ~= state.targetQuirk then
-					if isQuirkProtected(quirk) then
-						-- Server akan menolak roll di unit ini selama quirk-nya
-						-- terproteksi — lewati tanpa membuang roll.
-						protectedSkipped += 1
+					if blacklist[key] then
+						skippedBlack += 1
+					elseif isProtected(quirk) then
+						-- Seharusnya hanya target yang protected; kalau ada nama lain
+						-- yang masih protected, server akan menolak roll di unit ini.
+						skippedProtected += 1
 					else
-						-- Cost per unit; gagal hitung = 0 -> loop andalkan money-compare.
 						local okCost, cost = pcall(function()
 							return require(RS.Framework.Features.Quirks.QuirkUtil)
 								.GetRollCost(entry.name, entry.attributes)
@@ -350,9 +591,13 @@ local function computeCandidates(id)
 			end
 		end
 	end
-	if protectedSkipped > 0 then
-		log(string.format("kandidat: %d unit; %d dilewati karena quirk terproteksi", #candidates, protectedSkipped))
+	if skippedBlack > 0 or skippedProtected > 0 then
+		log(string.format(
+			"kandidat: %d unit (blacklist: %d, protected lain: %d)",
+			#candidates, skippedBlack, skippedProtected
+		))
 	end
+	state.candidateCount = #candidates
 	return candidates
 end
 
@@ -363,18 +608,16 @@ local function processCandidate(id, cand)
 	while state.running and id == runId do
 		local money = readMoney()
 		if money == nil then
-			-- Gagal baca uang: jangan fire (racun state), perlakukan sebagai penolakan.
 			log("WARN: gagal membaca uang — menunggu interval")
 			refusals += 1
-			if refusals >= STUCK_LIMIT then
+			if refusals >= state.stuckLimit then
 				log("WARN: unit stuck (data tidak terbaca?), skip: " .. cand.name)
 				return
 			end
-			task.wait(ROLL_INTERVAL)
+			task.wait(state.rollInterval)
 			continue
 		end
 		if money < cand.cost then
-			-- Uang kurang untuk roll cost unit ini: hentikan seluruh farm.
 			log(string.format("uang kurang (punya %d, butuh %d) — farm dihentikan", money, cand.cost))
 			notify("Quirk Farm", "Uang kurang untuk roll — farming dihentikan")
 			return "STOP"
@@ -388,59 +631,46 @@ local function processCandidate(id, cand)
 			RollRE:FireServer(cand.key)
 		end)
 		-- Selalu tunggu interval: jaga di atas debounce server 0.2s.
-		task.wait(ROLL_INTERVAL)
+		task.wait(state.rollInterval)
 
 		local after = readMoney() or before
 		local quirkNow = readQuirk(cand.entry)
 		stats.rolls += 1
 
 		if quirkNow == state.targetQuirk then
-			-- HIT: quirk target didapat.
+			-- HIT: target sudah diproteksi sejak start -> tidak ada yang perlu difire.
+			stats.accepted += 1
 			stats.hits += 1
 			stats.moneySpent += math.max(before - after, 0)
-			if state.protectOnHit and not state.protectedOnce then
-				-- Proteksi sekali per sesi: cukup melindungi nama quirk satu kali
-				-- karena proteksi bersifat GLOBAL per nama quirk.
-				pcall(function()
-					ProtectRE:FireServer(state.targetQuirk, true)
-				end)
-				state.protectedOnce = true
-				log("proteksi diaktifkan untuk " .. state.targetQuirk)
-			end
 			sendWebhook(cand.name, state.targetQuirk)
 			log(string.format("HIT: %s dapat %s (rolls=%d hits=%d)", cand.name, state.targetQuirk, stats.rolls, stats.hits))
 			notify("Quirk Farm", cand.name .. " dapat " .. state.targetQuirk .. "!")
 			return
 		end
-		if isQuirkProtected(quirkNow) then
-			-- Roll mendarat di quirk TERPROTEKSI non-target (mis. Midas Touch /
-			-- Fortune's Favor saat target Prodigy). Server menolak reroll unit yang
-			-- quirk-nya terproteksi (proteksi GLOBAL per nama quirk) -> quirk itu
-			-- AMAN tersimpan di unit ini. Langsung pindah unit: 0 roll terbuang
-			-- (tanpa cek ini, buang STUCK_LIMIT roll dulu sampai menyerah).
-			sendWebhook(cand.name, quirkNow, true)
-			log(string.format("SIMPAN: %s dapat quirk terproteksi non-target %s — unit dilewati, quirk dipertahankan", cand.name, quirkNow))
-			notify("Quirk Farm", cand.name .. " dapat " .. quirkNow .. " (terproteksi, disimpan)")
-			return
-		end
-		if after < before or quirkNow ~= quirkBefore then
-			-- Roll sukses tapi quirk meleset. Dual-signal: uang turun yang TERLIHAT
-			-- ATAU quirk berubah. Money-compare saja tidak cukup — di akun kaya
-			-- (magnitude ~1e17) ULP double ~64 sedangkan roll cost Common ~5, jadi
-			-- uang tak pernah terlihat berubah dan roll sukses dihitung penolakan.
-			-- Quirk berubah adalah sinyal utama; uang hanya pelengkap.
+
+		-- Dual-signal "roll diterima server": quirk unit BERUBAH adalah sinyal
+		-- utama; uang turun yang terlihat hanya pelengkap. Di akun kaya (1e17+)
+		-- ULP double (~64+) lebih besar dari roll cost Common, jadi uang sering
+		-- terbaca tidak berubah walau roll sukses.
+		if quirkNow ~= quirkBefore or after < before then
+			stats.accepted += 1
 			if after < before then
 				stats.moneySpent += (before - after)
 			end
+			if quirkNow ~= nil and quirkNow ~= quirkBefore and isRareQuirk(quirkNow) then
+				-- Kebijakan: hanya target yang ditahan. Rare non-target yang baru
+				-- mendarat dibuang (akan di-reroll pada iterasi berikutnya).
+				stats.rareLost += 1
+				log(string.format("buang %s di %s (bukan target, tidak ditahan)", quirkNow, cand.name))
+			end
 			refusals = 0
-			-- lanjut roll unit yang sama
 		else
-			-- Kedua sinyal diam: server tolak diam-diam (proteksi / debounce),
+			-- Kedua sinyal diam: server tolak diam-diam (zona/proteksi/debounce),
 			-- ATAU roll sukses yang kebetulan mendarat di quirk SAMA persis
 			-- (probabilitas rendah; STUCK_LIMIT=10 membuatnya ~0.18^10 ≈ 1e-8).
 			refusals += 1
-			if refusals >= STUCK_LIMIT then
-				log("WARN: unit stuck (protected/debounce?), skip: " .. cand.name)
+			if refusals >= state.stuckLimit then
+				log("WARN: unit stuck (di luar zona / protected / debounce?), skip: " .. cand.name)
 				return
 			end
 		end
@@ -450,7 +680,9 @@ local function processCandidate(id, cand)
 end
 
 -- Outer loop: satu rotasi penuh lewat semua kandidat, lalu recompute.
--- id = token generasi: hidup tepat selama generasinya masih aktif.
+-- Guard "rotasi tanpa roll diterima": kalau satu rotasi penuh tidak ada satu pun
+-- roll yang diterima server (mis. karakter di luar zona Quirks), farm dihentikan
+-- daripada berputar selamanya tanpa hasil.
 local function mainLoop(id)
 	while state.running and id == runId do
 		local candidates = computeCandidates(id)
@@ -463,6 +695,7 @@ local function mainLoop(id)
 			stop()
 			return
 		end
+		local acceptedBefore = stats.accepted
 		for _, cand in ipairs(candidates) do
 			if not (state.running and id == runId) then
 				return
@@ -474,8 +707,13 @@ local function mainLoop(id)
 				return
 			end
 		end
-		-- Rotasi penuh selesai -> recompute kandidat (target baru / unit yang sudah
-		-- dapat target sudah gugur).
+		if state.running and id == runId and stats.accepted == acceptedBefore then
+			log("WARN: satu rotasi penuh tanpa roll yang diterima server — farm dihentikan")
+			notify("Quirk Farm",
+				"Tidak ada roll yang diterima server. Pastikan karakter berdiri di area mesin Quirk (zona Quirks), lalu nyalakan ulang.")
+			stop()
+			return
+		end
 	end
 end
 
@@ -484,12 +722,14 @@ end
 function stop()
 	runId += 1 -- invalidasi SEMUA loop generasi sekarang
 	state.running = false
+	restoreProtections() -- kembalikan proteksi ke snapshot awal (target tetap terkunci)
 	syncToggle(false) -- toggle OFF dua-argumen tanpa callback -> tidak memicu start() lagi
 	notify("Quirk Farm", string.format(
-		"Farming dihentikan — rolls: %d, hits: %d, money spent: %d",
-		stats.rolls, stats.hits, stats.moneySpent
+		"Farming dihentikan — rolls: %d, hits: %d, rare dibuang: %d, money spent: %d",
+		stats.rolls, stats.hits, stats.rareLost, stats.moneySpent
 	))
-	log("stopped (rolls=" .. stats.rolls .. " hits=" .. stats.hits .. " moneySpent=" .. stats.moneySpent .. ")")
+	log(string.format("stopped (rolls=%d accepted=%d hits=%d rareLost=%d moneySpent=%d)",
+		stats.rolls, stats.accepted, stats.hits, stats.rareLost, stats.moneySpent))
 end
 
 --// Lifecycle: start \\--
@@ -500,7 +740,7 @@ local function start()
 		return true -- sudah berjalan: no-op
 	end
 
-	-- Resolve DataController: wajib ada, tanpa itu tidak ada data unit/uang.
+	-- Resolve DataController: wajib ada, tanpa itu tidak ada data unit/uang/proteksi.
 	local okDC, dcMod = pcall(function()
 		return require(RS.Framework.Features.Data.DataController)
 	end)
@@ -511,7 +751,7 @@ local function start()
 	end
 	DC = dcMod
 
-	-- Resolve remotes. RollRE wajib; ProtectRE hanya dipakai bila Protect on hit ON.
+	-- Resolve remotes. Keduanya wajib: proteksi target adalah bagian dari kebijakan.
 	local okRem, rollRemote, protectRemote = pcall(function()
 		return waitRemote("Roll"), waitRemote("SetQuirkProtected")
 	end)
@@ -533,7 +773,15 @@ local function start()
 	RollRE = rollRemote
 	ProtectRE = protectRemote
 
-	-- Snapshot cepat: pastikan Inventory dan Money terbaca sebelum loop roll.
+	-- Config Quirks wajib: batas "langka" (weight < 100) dipakai untuk proteksi
+	-- dan blacklist, sama dengan validasi server.
+	if not getQuirks() then
+		log("ERROR: config Quirks tidak terbaca — start ulang nanti")
+		notify("Quirk Farm", "Gagal start: config Quirks tidak terbaca")
+		return false
+	end
+
+	-- Snapshot cepat: pastikan uang terbaca sebelum menyentuh state proteksi.
 	local money0 = readMoney()
 	if money0 == nil then
 		log("ERROR: gagal membaca uang — start ulang nanti")
@@ -541,16 +789,322 @@ local function start()
 		return false
 	end
 
+	-- Snapshot proteksi LAMA dulu, baru blacklist, baru ubah proteksi.
+	protectionSnapshot = snapshotProtections()
+	state.selfProtected = {}
+	local blacklisted = rebuildBlacklist()
+
+	if not applyProtections(state.targetQuirk) then
+		log("WARN: proteksi target belum terkonfirmasi server — farm tetap jalan, proteksi manual disarankan")
+		notify("Quirk Farm", "Proteksi target belum terkonfirmasi — cek shield di mesin Quirk")
+	end
+
 	state.running = true
-	state.protectedOnce = false -- guard proteksi berlaku per sesi (per start)
 	runId += 1
 	local id = runId
 
 	task.spawn(mainLoop, id)
 	syncToggle(true) -- toggle ON dua-argumen tanpa callback -> tidak re-enter stop()
-	notify("Quirk Farm", "Farming dimulai — target: " .. state.targetQuirk)
-	log(string.format("aktif — target %s, protect on hit %s", state.targetQuirk, tostring(state.protectOnHit)))
+	notify("Quirk Farm", string.format(
+		"Farming dimulai — target %s (diproteksi), %d unit di-blacklist", state.targetQuirk, blacklisted
+	))
+	log(string.format("aktif — target %s diproteksi, rare lain dilepas, blacklist %d unit", state.targetQuirk, blacklisted))
 	return true
+end
+
+--// Remote config: Supabase edge function (opsional) \\--
+-- Probe fungsi HTTP SEKALI per load, urutan sama dengan web/public/collector.luau.
+-- Tanpa salah satu fungsi ini mode remote mematikan diri (satu baris log di bawah).
+local REMOTE_HTTP
+do
+	local okPick, fn = pcall(function()
+		if type(request) == "function" then
+			return request
+		end
+		if type(http_request) == "function" then
+			return http_request
+		end
+		if type(syn) == "table" and type(syn.request) == "function" then
+			return syn.request
+		end
+		if type(http) == "table" and type(http.request) == "function" then
+			return http.request
+		end
+		return nil
+	end)
+	REMOTE_HTTP = (okPick and type(fn) == "function") and fn or nil
+end
+
+local remoteInfo = state.remote
+local remoteOn = REMOTE_CONFIG.ENABLED and SYNC_KEY ~= "" and REMOTE_HTTP ~= nil
+remoteInfo.enabled = remoteOn
+remoteInfo.keySet = SYNC_KEY ~= ""
+local remoteLifecyclePending = false -- guard: start/stop remote tidak boleh dobel
+local remoteLifecycleWanted = nil -- keinginan running terbaru dari dashboard
+
+-- Satu POST JSON ke edge function. Tidak pernah mencatat URL key / body respons.
+local function remoteCall(payload)
+	if not REMOTE_HTTP then
+		return false, "http tidak tersedia"
+	end
+	local okEnc, body = pcall(function()
+		return HttpService:JSONEncode(payload)
+	end)
+	if not okEnc then
+		return false, "JSONEncode gagal"
+	end
+	local headers = { ["Content-Type"] = "application/json" }
+	if SYNC_KEY ~= "" then
+		headers["x-sync-key"] = SYNC_KEY
+	end
+	local okReq, res = pcall(REMOTE_HTTP, {
+		Url = REMOTE_CONFIG.URL,
+		Method = "POST",
+		Headers = headers,
+		Body = body,
+	})
+	if not okReq then
+		return false, "request error"
+	end
+	local code = type(res) == "table" and (res.StatusCode or res.status or res.Status) or nil
+	local raw = type(res) == "table" and (res.Body or res.body) or nil
+	if type(code) ~= "number" then
+		return false, "respons tidak valid"
+	end
+	return code >= 200 and code < 300, code, raw
+end
+
+-- Antrian transisi start/stop remote: satu transisi pada satu waktu, dan
+-- keinginan TERBARU menang (mis. stop datang saat start masih berjalan).
+local pumpRemoteLifecycle
+pumpRemoteLifecycle = function()
+	if remoteLifecyclePending then
+		return
+	end
+	local want = remoteLifecycleWanted
+	if want == nil then
+		return
+	end
+	remoteLifecycleWanted = nil
+	if want == isRunning() then
+		return
+	end
+	remoteLifecyclePending = true
+	task.spawn(function()
+		-- stop() WAJIB lewat lifecycle resmi (memulihkan proteksi).
+		local okRun, errRun = pcall(function()
+			if want then
+				start()
+			else
+				stop()
+			end
+		end)
+		remoteLifecyclePending = false
+		if not okRun then
+			log("WARN: remote " .. (want and "start" or "stop") .. " gagal: " .. tostring(errRun))
+		end
+		pumpRemoteLifecycle()
+	end)
+end
+
+-- Terapkan config remote HANYA saat rev berubah. Field bertipe salah dilewati
+-- (dicatat sekali) tanpa membatalkan field lain. state.appliedRev baru di-set
+-- setelah semua field selesai; kegagalan apa pun cuma WARN sekali.
+local function applyRemoteConfig(cfg)
+	if type(cfg) ~= "table" or type(cfg.rev) ~= "number" then
+		return false
+	end
+	if cfg.rev == state.appliedRev then
+		return false
+	end
+
+	local ignored = {}
+	local ok, err = pcall(function()
+		if cfg.target ~= nil then
+			if type(cfg.target) == "string" and isRareQuirk(cfg.target) then
+				if cfg.target ~= state.targetQuirk then
+					local api = ENV.quirkFarm
+					local applied = type(api) == "table" and type(api.setTarget) == "function"
+						and api.setTarget(cfg.target) or false
+					if not applied then
+						ignored[#ignored + 1] = "target"
+					end
+				end
+			else
+				ignored[#ignored + 1] = "target"
+			end
+		end
+
+		if cfg.blacklistRare ~= nil then
+			if type(cfg.blacklistRare) == "boolean" then
+				state.blacklistRare = cfg.blacklistRare
+				BLACKLIST_RARE_UNITS = cfg.blacklistRare -- jaga toggle UI tetap sinkron
+				if isRunning() then
+					rebuildBlacklist()
+				end
+			else
+				ignored[#ignored + 1] = "blacklistRare"
+			end
+		end
+
+		if cfg.rollInterval ~= nil then
+			if type(cfg.rollInterval) == "number"
+				and cfg.rollInterval >= 0.25 and cfg.rollInterval <= 5 then
+				state.rollInterval = cfg.rollInterval
+			else
+				ignored[#ignored + 1] = "rollInterval"
+			end
+		end
+
+		if cfg.stuckLimit ~= nil then
+			if type(cfg.stuckLimit) == "number"
+				and cfg.stuckLimit >= 3 and cfg.stuckLimit <= 100 then
+				state.stuckLimit = cfg.stuckLimit
+			else
+				ignored[#ignored + 1] = "stuckLimit"
+			end
+		end
+
+		if cfg.webhookUrl ~= nil then
+			if type(cfg.webhookUrl) == "string"
+				and (cfg.webhookUrl == ""
+					or cfg.webhookUrl:find("^https://discord%.com/api/webhooks/") ~= nil) then
+				state.webhookUrl = cfg.webhookUrl
+			else
+				ignored[#ignored + 1] = "webhookUrl"
+			end
+		end
+
+		if cfg.running ~= nil then
+			if type(cfg.running) == "boolean" then
+				if cfg.running ~= isRunning() then
+					remoteLifecycleWanted = cfg.running
+					pumpRemoteLifecycle()
+				end
+			else
+				ignored[#ignored + 1] = "running"
+			end
+		end
+
+		state.appliedRev = cfg.rev
+		remoteInfo.appliedRev = cfg.rev
+	end)
+
+	if not ok then
+		remoteInfo.lastError = tostring(err)
+		log("WARN: applyRemoteConfig gagal: " .. tostring(err))
+		return false
+	end
+	if #ignored > 0 then
+		log("WARN: config remote: field diabaikan (" .. table.concat(ignored, ", ") .. ")")
+	end
+	return true
+end
+
+local function buildStatus()
+	local blackCount = 0
+	for _ in pairs(blacklist) do
+		blackCount += 1
+	end
+	return {
+		running = isRunning(),
+		target = state.targetQuirk,
+		rolls = stats.rolls,
+		accepted = stats.accepted,
+		hits = stats.hits,
+		rareLost = stats.rareLost,
+		moneySpent = stats.moneySpent,
+		current = state.currentLabel or "",
+		candidates = state.candidateCount or 0,
+		blacklisted = blackCount,
+		appliedRev = state.appliedRev or 0,
+		lastSeenAt = os.time(),
+		version = "v803",
+	}
+end
+
+-- Pull config sekarang (dipanggil loop / API). Body tidak pernah di-log.
+local function pullConfig()
+	if not remoteOn then
+		return false, "remote nonaktif"
+	end
+	local ok, code, raw = remoteCall({
+		action = "pull",
+		userId = LocalPlayer.UserId,
+	})
+	remoteInfo.lastPullAt = os.time()
+	if not ok then
+		return false, code
+	end
+	local okDec, data = pcall(function()
+		return HttpService:JSONDecode(raw or "{}")
+	end)
+	if not okDec or type(data) ~= "table" then
+		return false, "JSONDecode gagal"
+	end
+	if data.ok ~= true then
+		return false, "ok=false"
+	end
+	if type(data.config) == "table" then
+		applyRemoteConfig(data.config)
+	end
+	return true, code
+end
+
+-- Push status walau farm sedang berhenti, supaya dashboard bisa menampilkan
+-- "offline since" dari lastSeenAt.
+local function pushStatus()
+	if not remoteOn then
+		return false, "remote nonaktif"
+	end
+	local ok, code = remoteCall({
+		action = "status",
+		userId = LocalPlayer.UserId,
+		status = buildStatus(),
+	})
+	if not ok then
+		remoteInfo.lastError = tostring(code)
+	end
+	return ok, code
+end
+
+-- Satu loop: tick 1s, pull tiap POLL, push tiap STATUS_EVERY.
+local function startRemoteLoop()
+	local gen = tonumber(ENV.__quirkFarmRemoteGen) or 0
+	task.spawn(function()
+		local pullElapsed = REMOTE_CONFIG.POLL -- pull pertama setelah POLL detik
+		local pushElapsed = REMOTE_CONFIG.STATUS_EVERY -- status pertama langsung
+		local failStreak = 0
+		while remoteOn and gen == (tonumber(ENV.__quirkFarmRemoteGen) or 0) do
+			if pullElapsed >= REMOTE_CONFIG.POLL then
+				pullElapsed = 0
+				local okCall, ok, code = pcall(pullConfig)
+				if not okCall then
+					ok, code = false, "pull error"
+				end
+				if ok then
+					if failStreak >= 5 then
+						log("remote: tersambung kembali (setelah " .. tostring(failStreak) .. " gagal)")
+					end
+					failStreak = 0
+					remoteInfo.lastError = nil
+				else
+					failStreak += 1
+					remoteInfo.lastError = tostring(code)
+					if failStreak % 5 == 0 then
+						log("WARN: remote pull gagal " .. tostring(failStreak) .. "x (" .. tostring(code) .. ")")
+					end
+				end
+			end
+			if pushElapsed >= REMOTE_CONFIG.STATUS_EVERY then
+				pushElapsed = 0
+				pcall(pushStatus)
+			end
+			task.wait(1)
+			pullElapsed += 1
+			pushElapsed += 1
+		end
+	end)
 end
 
 --// Jalur load \\--
@@ -562,6 +1116,9 @@ ENV.quirkFarm = {
 	stop = stop,
 	start = start,
 	isRunning = isRunning,
+	pullConfig = pullConfig,
+	pushStatus = pushStatus,
+	remote = remoteInfo,
 	setTarget = function(name)
 		if name ~= "Prodigy" and name ~= "Fortune's Favor" then
 			log("WARN: setTarget ditolak, target tidak dikenal: " .. tostring(name))
@@ -574,15 +1131,30 @@ ENV.quirkFarm = {
 				targetDropdown:Set(name, true)
 			end)
 		end
-		log("target diganti -> " .. name .. " (berlaku rotasi kandidat berikutnya)")
+		if state.running then
+			-- Terapkan langsung: target baru diproteksi, rare lain dilepas lagi,
+			-- dan blacklist dihitung ulang terhadap target baru.
+			local blacklisted = rebuildBlacklist()
+			applyProtections(name)
+			log(string.format("target -> %s (proteksi & blacklist diterapkan, %d unit blacklist)", name, blacklisted))
+		else
+			log("target diganti -> " .. name .. " (diterapkan saat start berikutnya)")
+		end
 		return true
+	end,
+	blacklist = blacklist,
+	rebuildBlacklist = function()
+		if not DC then
+			return 0
+		end
+		local n = rebuildBlacklist()
+		log(string.format("blacklist dihitung ulang: %d unit", n))
+		return n
 	end,
 	webhookUrl = WEBHOOK_URL, -- field override runtime: ENV.quirkFarm.webhookUrl = "https://..."
 }
 
 --// UI: Rayfield Gen 2 — dimuat + dibangun SEKALI per eksekusi, di jalur load \\--
--- Loader dibungkus pcall: gagal (tanpa HttpGet / tanpa jaringan) = lanjut tanpa
--- UI (headless), script tidak pernah gagal fatal keluar — kontrol tetap via API.
 do
 	local okRF, resRF = pcall(function()
 		return loadstring(game:HttpGet("https://sirius.menu/gen2"))()
@@ -602,7 +1174,7 @@ if Rayfield then
 			name = "Quirk Auto Farm",
 			subtitle = "Anime Dice — Prodigy / Fortune's Favor hunter",
 			theme = "ember",
-			showName = "Quirk Auto Farm", -- WAJIB string (truthy), bukan boolean: Rayfield assign langsung ke property Text
+			showName = "Quirk Auto Farm", -- WAJIB string (truthy), bukan boolean
 		})
 		rayfieldWindow = window
 		-- Handle disimpan global SEBELUM build elemen: walau build setengah jadi
@@ -613,17 +1185,22 @@ if Rayfield then
 
 		-- Dropdown single-mode: callback dapat string polos; handle .value SELALU
 		-- table bahkan di single mode — jangan pernah membaca .value sebagai string.
-		-- Ganti target hanya berlaku di rotasi kandidat berikutnya.
 		targetDropdown = tab:CreateDropdown({
 			name = "Target Quirk",
-			description = "Prodigy (~1/2778) atau Fortune's Favor (~1/11112). Berlaku rotasi berikutnya.",
+			description = "Prodigy (~1/2778) atau Fortune's Favor (~1/11112). Langsung diterapkan bila farm sedang jalan.",
 			options = { "Prodigy", "Fortune's Favor" },
 			value = "Prodigy",
 			forgetState = true, -- tidak ada persistensi target antar load
 			callback = function(selected)
 				if selected == "Prodigy" or selected == "Fortune's Favor" then
 					state.targetQuirk = selected
-					log("target diganti -> " .. selected .. " (berlaku rotasi kandidat berikutnya)")
+					if state.running then
+						local blacklisted = rebuildBlacklist()
+						applyProtections(selected)
+						log(string.format("target -> %s (proteksi & blacklist diterapkan, %d unit blacklist)", selected, blacklisted))
+					else
+						log("target diganti -> " .. selected .. " (diterapkan saat start berikutnya)")
+					end
 				end
 			end,
 		})
@@ -631,7 +1208,7 @@ if Rayfield then
 		-- Toggle: callback = JALUR SATU-SATUNYA start()/stop() dari UI.
 		farmToggle = tab:CreateToggle({
 			name = "Auto Farm Quirk",
-			description = "Roll unit Common sampai quirk target tercapai. Pakai uang in-game!",
+			description = "Roll unit Common sampai quirk target tercapai. Target diproteksi otomatis. Pakai uang in-game!",
 			value = false,
 			forgetState = true, -- tidak ada persistensi: AUTO_START = false, start manual
 			callback = function(value)
@@ -644,12 +1221,17 @@ if Rayfield then
 		})
 
 		tab:CreateToggle({
-			name = "Protect on hit",
-			description = "SetQuirkProtected(target, true) sekali per sesi saat quirk pertama didapat.",
+			name = "Blacklist unit langka",
+			description = "Unit yang sudah pegang quirk langka (selain target) tidak di-reroll, jadi inventori lama aman.",
 			value = true,
 			forgetState = true,
 			callback = function(value)
-				state.protectOnHit = value
+				BLACKLIST_RARE_UNITS = value
+				state.blacklistRare = value
+				if state.running and DC then
+					local n = rebuildBlacklist()
+					log(string.format("blacklist %s — %d unit", value and "ON" or "OFF", n))
+				end
 			end,
 		})
 
@@ -657,7 +1239,7 @@ if Rayfield then
 
 		statsText = tab:CreateText({
 			name = "Stats",
-			text = "rolls: 0 · hits: 0 · money spent: 0\ncurrent: - · target: Prodigy",
+			text = "rolls: 0 · accepted: 0 · hits: 0\nrare dibuang: 0 · money spent: 0\ncurrent: - · target: Prodigy",
 		})
 	end)
 	if not okUI then
@@ -665,15 +1247,36 @@ if Rayfield then
 	end
 end
 
+--// Remote config: satu baris status saat load \\--
+-- Mode ON hanya bila ENABLED + sync key terisi + fungsi HTTP tersedia. Tanpa
+-- key, mode lokal berjalan persis seperti sebelumnya (tanpa timer/HTTP).
+if not REMOTE_CONFIG.ENABLED then
+	log("remote config: OFF (nonaktif)")
+elseif SYNC_KEY == "" then
+	log("remote config: OFF (sync key kosong)")
+elseif not REMOTE_HTTP then
+	log("remote config: OFF (fungsi HTTP tidak tersedia)")
+else
+	log(string.format("remote config: ON (poll %ss)", tostring(REMOTE_CONFIG.POLL)))
+end
+
+if WEBHOOK_URL == "" then
+	log("discord webhook: OFF (isi dari dashboard / getgenv().QUIRK_WEBHOOK / webhook_url.txt)")
+end
+
+if remoteOn then
+	startRemoteLoop() -- menunggu running=true dari dashboard, tidak auto-start lokal
+end
+
 -- AUTO_START = false: script MEMAKAI uang in-game, jadi jangan pernah mulai
 -- otomatis. User menyalakan lewat toggle Rayfield atau getgenv().quirkFarm.start().
-if AUTO_START then
+-- Saat mode remote ON, start/stop sepenuhnya dari dashboard (running=true).
+if AUTO_START and not remoteOn then
 	local okStart, errStart = pcall(start)
 	if not okStart then
 		log("ERROR: start() threw: " .. tostring(errStart))
 	end
 end
 
--- Sinkron toggle dengan kenyataan APA PUN yang terjadi di atas (start sukses,
--- start gagal, AUTO_START false, atau Rayfield gagal dimuat -> no-op).
+-- Sinkron toggle dengan kenyataan APA PUN yang terjadi di atas
 syncToggle(isRunning())

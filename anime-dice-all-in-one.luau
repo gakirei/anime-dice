@@ -83,7 +83,25 @@ local FORCED = { [2] = true, [9] = true, [10] = true, [13] = true }
 
 -- Discord webhook: dikirim sekali saat Rolls mencapai TARGET_ROLLS
 local WEBHOOK_ENABLED = true
-local DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1422109131006808156/FzTcL84FAs4hfeBXUXnEad0RQrWXiVzd8bZwlqnc2IKq-W1zVZVFIhP66IPJi1yuhkR8"
+local DISCORD_WEBHOOK = "" -- JANGAN hardcode: getgenv().ANIME_DICE_WEBHOOK atau file "webhook_url.txt"
+-- Kosong = notifikasi Discord dilewati (script tetap jalan normal). URL tidak di-log.
+do
+	local function trimHook(value)
+		return (tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+	local g = (type(getgenv) == "function") and getgenv() or _G
+	local candidate = g.ANIME_DICE_WEBHOOK
+	if type(candidate) ~= "string" or trimHook(candidate) == "" then
+		candidate = DISCORD_WEBHOOK
+	end
+	if trimHook(candidate) == "" and type(readfile) == "function" then
+		local ok, data = pcall(readfile, "webhook_url.txt")
+		if ok and type(data) == "string" then
+			candidate = data
+		end
+	end
+	DISCORD_WEBHOOK = trimHook(candidate)
+end
 
 -- Disconnect client saat target tercapai (1001 = lewat 1000, supaya server pasti mencatat)
 local LEAVE_ON_TARGET = true
@@ -236,6 +254,10 @@ local function httpPost(url, payload)
 end
 
 local function notifyTradeReady(rolls, isTest)
+	if DISCORD_WEBHOOK == "" then
+		print("[aio] discord webhook OFF (set getgenv().ANIME_DICE_WEBHOOK atau webhook_url.txt)")
+		return false, "webhook off"
+	end
 	local acc = LocalPlayer
 	local payload = {
 		username = "Anime Dice Auto-Farm",
@@ -695,7 +717,7 @@ task.spawn(function()
 			if r >= TARGET_ROLLS then
 				PHASE = "DONE"
 				print(("[aio] DONE — Rolls=%d >= %d, Trade UNLOCKED"):format(r, TARGET_ROLLS))
-				if WEBHOOK_ENABLED and not ENV.__aioNotified then
+				if WEBHOOK_ENABLED and DISCORD_WEBHOOK ~= "" and not ENV.__aioNotified then
 					ENV.__aioNotified = true
 					task.spawn(function()
 						notifyTradeReady(r, false)
