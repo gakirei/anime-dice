@@ -248,20 +248,21 @@ getgenv().quirkFarm.setTarget("Fortune's Favor")
 getgenv().quirkFarm.rebuildBlacklist()
 ```
 
-Discord webhook: **nothing is hardcoded** (the repo is public). The URL is resolved in this
-order — first non-empty wins:
+Discord webhook: **nothing is hardcoded** (the repo is public) and, with the remote channel on,
+**nothing webhook-related is on the device either** — the dashboard stores the URL in Supabase
+and the server posts the embed. The device only falls back to a local URL if the relay itself
+fails, resolved in this order (first non-empty wins):
 
-1. the **Webhook URL** field in the dashboard card (sent through the remote config),
-2. `getgenv().quirkFarm.webhookUrl` at runtime,
-3. `getgenv().QUIRK_WEBHOOK` set before loading the script,
-4. a `webhook_url.txt` file in the executor workspace.
+1. `getgenv().quirkFarm.webhookUrl` at runtime,
+2. `getgenv().QUIRK_WEBHOOK` set before loading the script,
+3. a `webhook_url.txt` file in the executor workspace.
 
 ```lua
 getgenv().quirkFarm.webhookUrl = "https://discord.com/api/webhooks/..."
 ```
 
-With no webhook, the farm runs normally and Discord is simply skipped (one `OFF` line in
-the console). The URL is never logged and never written to disk by the script.
+With no local webhook, a failed relay is simply logged. The URL is never logged and never
+written to disk by the script.
 
 Notes:
 
@@ -284,43 +285,40 @@ Notes:
   no force flag, no memory/state patching.
 - Tested against `[🎃] Anime Dice` v803.
 
-### Remote control from the web dashboard (optional)
+### Remote control from the web dashboard
 
 The farm can be driven from the [`web/`](./web) dashboard instead of the Rayfield
 window: settings are stored in Supabase, **Start/Stop** is a button in the browser, and
 the script streams live stats back.
 
-**Off by default.** `SYNC_KEY = ""` means pure local mode — no timers, no HTTP calls,
-exactly the behaviour described above. To enable it:
+**No secret is stored on the device.** The channel is open: requests are keyed by your
+Roblox user id, the sync key is optional, and the Discord webhook URL never reaches the
+game client (the server relays the notification). Setup:
 
-1. Run the migration `web/supabase/migrations/20261026000000_quirk_control.sql` in the
-   Supabase SQL editor (idempotent).
+1. Run both migrations in the Supabase SQL editor, in order (idempotent):
+   `web/supabase/migrations/20261026000000_quirk_control.sql`, then
+   `web/supabase/migrations/20261026010000_quirk_control_open_channel.sql`.
 2. Deploy the edge function: `supabase functions deploy quirk --no-verify-jwt`
    (or paste `web/supabase/functions/quirk/index.ts` in the dashboard and disable JWT
    verification). Full steps: [`web/supabase/README.md`](./web/supabase/README.md).
-3. Give the script your sync key from the dashboard's **Sync key** panel — **without
-   committing it**. Any of these works, checked in this order:
-   - `getgenv().QUIRK_SYNC_KEY = "..."` set before loading the script,
-   - `REMOTE_CONFIG.SYNC_KEY` in the config block (local/private copies only),
-   - a `quirk_sync_key.txt` file in the executor workspace (recommended — works even
-     when the script itself is loaded from the raw GitHub URL).
-
-   Then re-run the script: the console shows `remote config: ON (poll 15s)`. With no key
-   it stays `OFF (sync key kosong)` and nothing is sent. The key is never logged.
+3. Load the script. The console shows `remote config: ON (poll 15s, open channel)` — no
+   key, no file, nothing to paste. Mode is off only if HTTP is unavailable
+   (`OFF (fungsi HTTP tidak tersedia)`).
 4. **Save the settings once** in the dashboard. That creates the `quirk_controls` row and
-   bumps `rev`; a pull against a missing row returns `config: null` and changes nothing.
-5. Open the account's detail page in the dashboard — the **Quirk Farm** card shows the
-   same settings as the in-game window (target, blacklist, roll interval, stuck limit,
-   webhook URL) plus **Start/Stop** and the live counters (updates within ~15s for config,
-   ~30s for stats).
+   bumps `rev`; before it exists, `pull` returns `config: null` and `status`/`hit` answer
+   `404 not registered`.
+5. Open the account's detail page — the **Quirk Farm** card shows the same settings as the
+   in-game window (target, blacklist, roll interval, stuck limit, webhook URL) plus
+   **Start/Stop** and the live counters (updates within ~15s for config, ~30s for stats).
 
 How it works:
 
 | Direction | Path | Cadence |
 |---|---|---|
 | Browser → Supabase | direct PostgREST write to `public.quirk_controls.config` (RLS: `owner_id = auth.uid()`) | on save / on toggle (`rev` bumps) |
-| Script → Supabase | `POST /functions/v1/quirk` `{action:"pull"}`, `x-sync-key` | every 15s, applies only when `rev` changed |
-| Script → Supabase | `POST /functions/v1/quirk` `{action:"status"}`, `x-sync-key` | every 30s |
+| Script → Supabase | `POST /functions/v1/quirk` `{action:"pull", userId}` | every 15s, applies only when `rev` changed |
+| Script → Supabase | `POST /functions/v1/quirk` `{action:"status", userId, status}` | every 30s (server enforces 5s) |
+| Script → Supabase | `POST /functions/v1/quirk` `{action:"hit", userId, unit, quirk}` on a hit | server posts the Discord embed (15s floor) |
 | Supabase → Browser | realtime on `quirk_controls` (polling fallback) | live |
 
 Notes:
@@ -331,8 +329,14 @@ Notes:
   applied on start, restored on stop).
 - Local UI still works while remote mode is on; the last applied remote `rev` wins on the
   next pull.
-- The function authenticates with the sync key only and writes **status** only — it never
-  accepts config writes, so a leaked sync key cannot change your settings.
+- The function **never accepts config writes** — only the signed-in browser can change
+  settings through RLS. It writes `status` and stamps `last_hit_at`.
+- Webhook notifications are posted **by the server**. `pull` strips every key containing
+  `webhook`, so the URL is not on the device even in memory.
 - Status is a fixed 13-key whitelist (`running`, `target`, `rolls`, `accepted`, `hits`,
   `rareLost`, `moneySpent`, `current`, `candidates`, `blacklisted`, `appliedRev`,
   `lastSeenAt`, `version`); anything else is dropped server-side.
+- **Open-channel tradeoff:** anyone who knows your Roblox user id can read these settings
+  (never the webhook URL) and can spoof the telemetry numbers. They cannot change config,
+  stop the farm, or post to your webhook beyond the 15s rate limit. To tighten later, set
+  a sync key on the device — the function already accepts `x-sync-key` when present.

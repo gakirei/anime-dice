@@ -50,10 +50,14 @@
 --             rebuildBlacklist() -- hitung ulang blacklist dari inventori sekarang
 --             pullConfig()   -- tarik config dari dashboard sekarang (true, code | false, err)
 --             pushStatus()   -- kirim status ke dashboard sekarang
+--             relayHit(unit, quirk) -- kirim HIT lewat server (Discord diposting server)
+--             testHit()      -- kirim HIT percobaan lewat relay (cek cepat dari console)
 --             remote         -- { enabled, keySet, lastError, lastPullAt, appliedRev }
--- Remote : sync key diambil dari getgenv().QUIRK_SYNC_KEY, lalu REMOTE_CONFIG.SYNC_KEY,
---          lalu file "quirk_sync_key.txt" (readfile). Kosong semua = mode lokal murni.
---          Key tidak pernah di-log dan tidak pernah ditulis ke disk oleh script ini.
+-- Remote : OPEN CHANNEL — sync key TIDAK wajib, jadi device tidak menyimpan rahasia.
+--          Kalau key diisi, ia tetap dikirim sebagai x-sync-key (opsional, untuk
+--          pengetatan nanti): getgenv().QUIRK_SYNC_KEY -> REMOTE_CONFIG.SYNC_KEY ->
+--          file "quirk_sync_key.txt". Webhook Discord TIDAK PERNAH diterima device:
+--          server men-strip nilainya dari config dan yang memposting ke Discord.
 -- Idempotent: re-running stops the previous instance first (yang juga memulihkan
 -- proteksi), unloads the previous Rayfield window, then builds exactly one new
 -- window — no stacked windows, no double loops. Lifecycle memakai generation
@@ -93,10 +97,11 @@ local LocalPlayer = Players.LocalPlayer
 --// Config \\--
 local AUTO_START = false -- script MEMAKAI uang in-game: jangan start otomatis
 local ROLL_INTERVAL = 0.25 -- server debounce 0.2s per pemain -> 0.25s ambang aman
-local WEBHOOK_URL = "" -- JANGAN hardcode: isi dari dashboard (card Quirk Farm), getgenv().QUIRK_WEBHOOK, atau file "webhook_url.txt"
--- Urutan sumber webhook: config dashboard -> getgenv().quirkFarm.webhookUrl ->
--- getgenv().QUIRK_WEBHOOK -> file "webhook_url.txt". Kosong semua = tanpa notifikasi
--- (farm tetap jalan, hanya Discord yang dilewati). URL tidak pernah di-log.
+local WEBHOOK_URL = "" -- HANYA untuk mode lokal / fallback. JANGAN hardcode: getgenv().QUIRK_WEBHOOK atau file "webhook_url.txt"
+-- Webhook dashboard TIDAK ikut ke device (server men-strip-nya) — kalau remote
+-- aktif, notifikasi HIT dikirim lewat relay server. Urutan sumber lokal:
+-- getgenv().quirkFarm.webhookUrl -> getgenv().QUIRK_WEBHOOK -> file "webhook_url.txt".
+-- Kosong semua = tanpa notifikasi lokal (farm tetap jalan). URL tidak pernah di-log.
 do
 	local function trimHook(value)
 		return (tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""))
@@ -117,9 +122,10 @@ local STUCK_LIMIT = 10 -- ambigu berturut-turut (quirk tak berubah + uang tak tu
 local PROTECT_SETTLE_TIMEOUT = 3 -- detik menunggu replikasi SetQuirkProtected dikonfirmasi client
 local BLACKLIST_RARE_UNITS = true -- blacklist unit lama yang sudah pegang quirk langka (weight < 100) selain target
 
---// Remote config (Supabase edge function) — opsional \\--
--- SYNC_KEY kosong = mode lokal: tidak ada timer/HTTP, perilaku persis seperti
--- sebelumnya. Isi key dari dashboard; JANGAN pernah hardcode key asli di sini.
+--// Remote config (Supabase edge function) \\--
+-- OPEN CHANNEL: device tidak menyimpan rahasia apa pun. Sync key opsional; kalau
+-- diisi tetap dikirim sebagai x-sync-key (untuk pengetatan nanti). Webhook Discord
+-- hanya hidup di server (lihat blok WEBHOOK_URL di bawah).
 local REMOTE_CONFIG = {
 	ENABLED      = true,
 	URL          = "https://rlbmftsefonfdqfhyjij.supabase.co/functions/v1/quirk",
@@ -542,6 +548,10 @@ local function sendWebhook(unitName, quirk)
 	log("discord webhook " .. (ok and "OK" or "GAGAL") .. ": " .. tostring(info))
 end
 
+-- notifyHit = satu-satunya jalur notifikasi HIT. Default-nya webhook lokal; di
+-- bawah nanti di-reassign ke relay server (device tidak pernah pegang URL webhook).
+local notifyHit = sendWebhook
+
 --// Farm loop \\--
 -- Snapshot inventory -> filter unit Common yang quirknya BELUM target, tidak
 -- di-blacklist, dan tidak sedang memegang quirk terproteksi (target holders
@@ -642,7 +652,7 @@ local function processCandidate(id, cand)
 			stats.accepted += 1
 			stats.hits += 1
 			stats.moneySpent += math.max(before - after, 0)
-			sendWebhook(cand.name, state.targetQuirk)
+			notifyHit(cand.name, state.targetQuirk)
 			log(string.format("HIT: %s dapat %s (rolls=%d hits=%d)", cand.name, state.targetQuirk, stats.rolls, stats.hits))
 			notify("Quirk Farm", cand.name .. " dapat " .. state.targetQuirk .. "!")
 			return
@@ -836,7 +846,7 @@ do
 end
 
 local remoteInfo = state.remote
-local remoteOn = REMOTE_CONFIG.ENABLED and SYNC_KEY ~= "" and REMOTE_HTTP ~= nil
+local remoteOn = REMOTE_CONFIG.ENABLED and REMOTE_HTTP ~= nil -- open channel: sync key opsional
 remoteInfo.enabled = remoteOn
 remoteInfo.keySet = SYNC_KEY ~= ""
 local remoteLifecyclePending = false -- guard: start/stop remote tidak boleh dobel
@@ -1068,6 +1078,66 @@ local function pushStatus()
 	return ok, code
 end
 
+-- HIT lewat server: webhook Discord disimpan di Supabase, jadi device TIDAK
+-- pernah memegang URL-nya. Server yang menyusun embed + rate-limit 15s.
+local function relayHit(unitName, quirk)
+	if not remoteOn then
+		return false, { code = "remote nonaktif" }
+	end
+	local ok, code, raw = remoteCall({
+		action = "hit",
+		userId = LocalPlayer.UserId,
+		player = LocalPlayer.Name,
+		unit = tostring(unitName or ""),
+		quirk = tostring(quirk or ""),
+		rolls = stats.rolls,
+		hits = stats.hits,
+		rareLost = stats.rareLost,
+		moneySpent = stats.moneySpent,
+	})
+	if not ok then
+		remoteInfo.lastError = tostring(code)
+		return false, { code = code }
+	end
+	local delivered = nil
+	if type(raw) == "string" then
+		local okDec, data = pcall(function()
+			return HttpService:JSONDecode(raw)
+		end)
+		if okDec and type(data) == "table" then
+			delivered = data.delivered == true
+		end
+	end
+	return true, { code = code, delivered = delivered }
+end
+
+-- HIT: relay server kalau remote aktif; kalau transport-nya gagal, coba webhook
+-- lokal (kalau ada). Tidak pernah menggagalkan farm.
+notifyHit = function(unitName, quirk)
+	if not remoteOn then
+		sendWebhook(unitName, quirk)
+		return
+	end
+	local ok, info = relayHit(unitName, quirk)
+	if ok then
+		log("discord relay " .. (info.delivered and "OK" or "dilewati") .. " (server)")
+		return
+	end
+	log("WARN: relay HIT gagal (" .. tostring(info.code) .. "), fallback webhook lokal")
+	sendWebhook(unitName, quirk)
+end
+
+-- Kirim HIT percobaan lewat jalur relay yang sama (untuk cek dari console).
+local function testHit()
+	local ok, info = relayHit("TestUnit", state.targetQuirk)
+	if ok then
+		log("testHit: terkirim ke server (delivered=" .. tostring(info.delivered) .. ")")
+	else
+		log("testHit: gagal (" .. tostring(info.code) .. ")")
+	end
+	return ok, info
+end
+
 -- Satu loop: tick 1s, pull tiap POLL, push tiap STATUS_EVERY.
 local function startRemoteLoop()
 	local gen = tonumber(ENV.__quirkFarmRemoteGen) or 0
@@ -1118,6 +1188,8 @@ ENV.quirkFarm = {
 	isRunning = isRunning,
 	pullConfig = pullConfig,
 	pushStatus = pushStatus,
+	relayHit = relayHit,
+	testHit = testHit,
 	remote = remoteInfo,
 	setTarget = function(name)
 		if name ~= "Prodigy" and name ~= "Fortune's Favor" then
@@ -1248,19 +1320,19 @@ if Rayfield then
 end
 
 --// Remote config: satu baris status saat load \\--
--- Mode ON hanya bila ENABLED + sync key terisi + fungsi HTTP tersedia. Tanpa
--- key, mode lokal berjalan persis seperti sebelumnya (tanpa timer/HTTP).
+-- Mode ON bila ENABLED + fungsi HTTP tersedia (open channel, key opsional).
+-- Matikan lewat REMOTE_CONFIG.ENABLED = false kalau mau mode lokal murni.
 if not REMOTE_CONFIG.ENABLED then
 	log("remote config: OFF (nonaktif)")
-elseif SYNC_KEY == "" then
-	log("remote config: OFF (sync key kosong)")
 elseif not REMOTE_HTTP then
 	log("remote config: OFF (fungsi HTTP tidak tersedia)")
+elseif SYNC_KEY ~= "" then
+	log(string.format("remote config: ON (poll %ss, key)", tostring(REMOTE_CONFIG.POLL)))
 else
-	log(string.format("remote config: ON (poll %ss)", tostring(REMOTE_CONFIG.POLL)))
+	log(string.format("remote config: ON (poll %ss, open channel)", tostring(REMOTE_CONFIG.POLL)))
 end
 
-if WEBHOOK_URL == "" then
+if not remoteOn and WEBHOOK_URL == "" then
 	log("discord webhook: OFF (isi dari dashboard / getgenv().QUIRK_WEBHOOK / webhook_url.txt)")
 end
 
