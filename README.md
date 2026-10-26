@@ -230,6 +230,23 @@ On a hit: the unit is dropped from the candidate list (target is already protect
 start), the Discord embed fires, and the loop moves to the next unit. `stop()` restores
 the protection map captured at start, leaving the target protected.
 
+### Auto-walk to the machine
+
+`start()` no longer needs you to stand at the machine. If the character is more than
+`WALK_NEAR_DIST` (40 studs) from the centre of `Workspace.Zones.Quirks`, the script walks
+there first using **PathfindingService** + `Humanoid:MoveTo`, then starts rolling.
+
+- Teleport is not an option: the game's anti-cheat snaps a client-side `CFrame`/`PivotTo`
+  back within about a second (verified: 183 studs reverted). Real walking is allowed.
+- The path is recomputed when a waypoint is blocked or not reached within 12s, with jumps
+  on `Jump` waypoints and on stalls; at most 6 path attempts, 150s total.
+- If it cannot arrive, `start()` aborts with a notification instead of rolling from far
+  away (which the server would refuse anyway).
+- Rolling only begins after arrival, so no rolls are wasted on the walk.
+- Tunables in the script config: `AUTO_WALK`, `WALK_NEAR_DIST`, `WALK_TIMEOUT`.
+- Measured: 107 studs away → arrived (8 studs from centre) in 4.6s, then 9/10 rolls
+  accepted on the first rotation.
+
 ### UI (Rayfield Gen 2)
 
 The script opens a **[Rayfield Gen 2](https://docs.sirius.menu/rayfield-gen2)** window
@@ -281,10 +298,11 @@ Notes:
 
 - Burns real in-game money — every accepted roll costs (Common roll cost ranges roughly
   5–2000 depending on the unit).
-- Keep your character near the **Quirk machine** while farming. Rolls are accepted from a
-  fairly loose range (verified ~31 studs from the zone center), but if the server stops
-  accepting them the farm stops after three refused units instead of spinning
-  (verified: 99 studs away → 30 rolls, 0 accepted, stopped after ~20s).
+- You no longer have to stand at the **Quirk machine**: `start()` walks there by itself
+  (see *Auto-walk to the machine*). Rolls are accepted from a fairly loose range
+  (verified ~31 studs from the zone centre); if the server still refuses them, the farm
+  stops after three refused units instead of spinning (verified: 99 studs away → 30 rolls,
+  0 accepted, stopped after ~20s). Set `AUTO_WALK = false` to keep it fully manual.
 - Units already holding the **target** quirk are excluded from candidates. Units holding a
   rare quirk are excluded too *while the blacklist is on* — with it off, their quirk can
   be rerolled away.

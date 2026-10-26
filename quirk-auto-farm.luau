@@ -54,6 +54,7 @@
 --             pushStatus()   -- kirim status ke dashboard sekarang
 --             relayHit(unit, quirk) -- kirim HIT lewat server (Discord diposting server)
 --             testHit()      -- kirim HIT percobaan lewat relay (cek cepat dari console)
+--             distanceToMachine() -- jarak (studs) ke pusat zona Quirks, nil kalau tak terbaca
 --             remote         -- { enabled, keySet, lastError, lastPullAt, appliedRev }
 -- Remote : OPEN CHANNEL — sync key TIDAK wajib, jadi device tidak menyimpan rahasia.
 --          Kalau key diisi, ia tetap dikirim sebagai x-sync-key (opsional, untuk
@@ -93,6 +94,7 @@ end
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
+local PathfindingService = game:GetService("PathfindingService")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -124,6 +126,11 @@ do
 end
 local STUCK_LIMIT = 10 -- ambigu berturut-turut (quirk tak berubah + uang tak turun) sebelum unit dilewati; 10 menutup roll sukses yang kebetulan mendarat di quirk sama (~0.18^10)
 local EARLY_ABORT_UNITS = 3 -- unit berturut-turut ditolak tanpa satu pun accepted -> farm stop (indikasi di luar zona)
+local AUTO_WALK = true -- jalan sendiri ke mesin Quirk saat start kalau masih jauh
+local WALK_NEAR_DIST = 40 -- sudah dianggap "di mesin" bila jarak ke pusat zona <= ini
+local WALK_TIMEOUT = 150 -- batas total berjalan; lewat ini = gagal, arahkan manual
+local WALK_WAYPOINT_TIMEOUT = 12 -- batas per waypoint sebelum path dihitung ulang
+local WALK_RECOMPUTE_LIMIT = 6 -- jumlah path yang boleh dihitung ulang
 local PROTECT_SETTLE_TIMEOUT = 3 -- detik menunggu replikasi SetQuirkProtected dikonfirmasi client
 local BLACKLIST_RARE_UNITS = true -- blacklist unit lama yang sudah pegang quirk langka (weight < 100) selain target
 
@@ -864,6 +871,120 @@ function stop()
 		stats.rolls, stats.accepted, stats.hits, stats.rareLost, stats.moneySpent))
 end
 
+--// Auto-walk ke mesin Quirk (PathfindingService, bukan teleport) \\--
+local function getQuirksZone()
+	local zones = workspace:FindFirstChild("Zones")
+	return zones and zones:FindFirstChild("Quirks") or nil
+end
+
+local function distanceToMachine()
+	local zone = getQuirksZone()
+	local char = LocalPlayer.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not (zone and root) then
+		return nil
+	end
+	return (root.Position - zone.Position).Magnitude
+end
+
+-- Berjalan sungguhan lewat Humanoid:MoveTo. Anti-cheat game menolak/snap-back
+-- teleport, tapi gerakan normal diizinkan (terverifikasi).
+local function walkToMachine(id)
+	local zone = getQuirksZone()
+	if not zone then
+		log("WARN: zona Quirks tidak ditemukan - arahkan manual")
+		return false
+	end
+	local goal = zone.Position
+	local deadline = os.clock() + WALK_TIMEOUT
+	local attempts = 0
+	while state.running and id == runId and os.clock() < deadline do
+		local char = LocalPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		if not (hum and root) or hum.Health <= 0 then
+			task.wait(1) -- menunggu respawn
+			continue
+		end
+		local dist = (root.Position - goal).Magnitude
+		if dist <= WALK_NEAR_DIST then
+			log(string.format("tiba di mesin Quirk (%.0f studs dari pusat zona)", dist))
+			return true
+		end
+		if attempts >= WALK_RECOMPUTE_LIMIT then
+			break
+		end
+		attempts += 1
+
+		local path = PathfindingService:CreatePath({
+			AgentRadius = 2.5,
+			AgentHeight = 5,
+			AgentCanJump = true,
+			WaypointSpacing = 6,
+		})
+		local okCompute = pcall(function()
+			path:ComputeAsync(root.Position, goal)
+		end)
+		if not okCompute or path.Status ~= Enum.PathStatus.Success then
+			log(string.format("WARN: path ke mesin gagal (%s), coba lagi", tostring(path.Status)))
+			task.wait(1)
+			continue
+		end
+
+		local blocked = false
+		local conn = path.Blocked:Connect(function()
+			blocked = true
+		end)
+		for index, wp in ipairs(path:GetWaypoints()) do
+			if index == 1 then
+				continue
+			end
+			if blocked or not (state.running and id == runId) then
+				break
+			end
+			if wp.Action == Enum.PathWaypointAction.Jump then
+				hum.Jump = true
+			end
+			hum:MoveTo(wp.Position)
+			local wpDeadline = os.clock() + WALK_WAYPOINT_TIMEOUT
+			local lastPos = root.Position
+			local stalled = 0
+			while (root.Position - wp.Position).Magnitude > 4.5 do
+				if blocked or not (state.running and id == runId) or os.clock() > wpDeadline then
+					break
+				end
+				task.wait(0.15)
+				if (root.Position - lastPos).Magnitude < 0.6 then
+					stalled += 0.15
+					if stalled > 1.5 then
+						hum.Jump = true
+						stalled = 0
+					end
+				else
+					lastPos = root.Position
+					stalled = 0
+				end
+			end
+		end
+		conn:Disconnect()
+		hum:MoveTo(root.Position)
+		task.wait(0.3)
+	end
+
+	local okNow = false
+	local charNow = LocalPlayer.Character
+	local rootNow = charNow and charNow:FindFirstChild("HumanoidRootPart")
+	local zoneNow = getQuirksZone()
+	if state.running and id == runId and rootNow and zoneNow then
+		okNow = (rootNow.Position - zoneNow.Position).Magnitude <= WALK_NEAR_DIST
+	end
+	if not okNow then
+		log(string.format("WARN: auto-walk gagal, sisa %.0f studs dari mesin (%d path dicoba)",
+			distanceToMachine() or -1, attempts))
+	end
+	return okNow
+end
+
 --// Lifecycle: start \\--
 -- start(): no-op kalau sudah jalan; kegagalan apa pun recoverable (log + notify,
 -- toggle dipaksa OFF, window tetap hidup). Return true = berjalan.
@@ -934,6 +1055,19 @@ local function start()
 	state.running = true
 	runId += 1
 	local id = runId
+
+	if AUTO_WALK then
+		local dist = distanceToMachine()
+		if dist ~= nil and dist > WALK_NEAR_DIST then
+			log(string.format("jarak ke mesin Quirk %.0f studs - berjalan otomatis", dist))
+			notify("Quirk Farm", "Berjalan ke mesin Quirk...")
+			if not walkToMachine(id) then
+				notify("Quirk Farm", "Tidak bisa mencapai mesin Quirk otomatis - dekatkan karakter lalu start lagi.")
+				stop()
+				return false
+			end
+		end
+	end
 
 	task.spawn(mainLoop, id)
 	syncToggle(true) -- toggle ON dua-argumen tanpa callback -> tidak re-enter stop()
@@ -1320,6 +1454,7 @@ ENV.quirkFarm = {
 	pushStatus = pushStatus,
 	relayHit = relayHit,
 	testHit = testHit,
+	distanceToMachine = distanceToMachine,
 	remote = remoteInfo,
 	setTarget = function(name)
 		if not isKnownQuirk(name) then
