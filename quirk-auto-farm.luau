@@ -99,6 +99,8 @@ local LocalPlayer = Players.LocalPlayer
 --// Config \\--
 local AUTO_START = false -- script MEMAKAI uang in-game: jangan start otomatis
 local ROLL_INTERVAL = 0.25 -- server debounce 0.2s per pemain -> 0.25s ambang aman
+local REFUSAL_CONFIRM_READS = 6 -- baca ulang quirk sebelum menyimpulkan roll ditolak (replikasi bisa > interval roll); hanya 2 refusal pertama per unit
+local REFUSAL_CONFIRM_DELAY = 0.05 -- jeda tiap baca ulang; total ~0.3s
 local WEBHOOK_URL = "" -- HANYA untuk mode lokal / fallback. JANGAN hardcode: getgenv().QUIRK_WEBHOOK atau file "webhook_url.txt"
 -- Webhook dashboard TIDAK ikut ke device (server men-strip-nya) — kalau remote
 -- aktif, notifikasi HIT dikirim lewat relay server. Urutan sumber lokal:
@@ -183,6 +185,7 @@ local state = {
 	stuckLimit = STUCK_LIMIT, -- live: ambang unit dianggap stuck
 	webhookUrl = "", -- override runtime (remote); kosong = pakai WEBHOOK_URL
 	appliedRev = 0, -- rev config remote terakhir yang sudah diterapkan
+	lateSignalSeen = false, -- sudah pernah lihat sinyal roll telat? (log sekali)
 	remote = { enabled = false, keySet = false, lastError = nil, lastPullAt = 0, appliedRev = 0 },
 }
 local runId = 0 -- generation token: tiap start/stop naik 1 -> loop generasi lama mati bersih
@@ -732,6 +735,26 @@ local function processCandidate(id, cand)
 		local after = readMoney() or before
 		local quirkNow = readQuirk(cand.entry)
 		stats.rolls += 1
+
+		if quirkNow == quirkBefore and after >= before and refusals < 2 then
+			for _ = 1, REFUSAL_CONFIRM_READS do
+				task.wait(REFUSAL_CONFIRM_DELAY)
+				if not (state.running and id == runId) then
+					return
+				end
+				local retryMoney = readMoney() or after
+				local retryQuirk = readQuirk(cand.entry)
+				if retryQuirk ~= quirkBefore or retryMoney < before then
+					quirkNow = retryQuirk
+					after = retryMoney
+					if not state.lateSignalSeen then
+						state.lateSignalSeen = true
+						log("sinyal roll datang terlambat - skip ditahan (replikasi lambat)")
+					end
+					break
+				end
+			end
+		end
 
 		if quirkNow == state.targetQuirk then
 			-- HIT: target sudah diproteksi sejak start -> tidak ada yang perlu difire.

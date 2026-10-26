@@ -217,7 +217,14 @@ server with a **0.2s debounce** — the script keeps a 0.25s interval. The serve
 Success detection is **dual-signal**: a roll succeeded when the unit's quirk string
 **changes**, or money visibly **decreases**. Money comparison alone is unreliable — on
 rich accounts (`~1e26`) a double's ULP is far larger than a Common roll cost (~5), and
-passive income muddies the direction, so every success would read as a refusal.
+passive income muddies the direction, so every success would read as a refusal. Before
+declaring a refusal the script re-reads the quirk for up to ~300ms (first two refusals of
+each unit), so a late replication is not mistaken for a rejected roll.
+
+One unit is rolled **continuously until the target lands** — it only moves on after a hit,
+when money runs out, or after `stuckLimit` (default 10) consecutive refusals. Skipped units
+are not blacklisted: they come back in the next rotation, which starts as soon as every
+candidate has been visited once.
 
 On a hit: the unit is dropped from the candidate list (target is already protected since
 start), the Discord embed fires, and the loop moves to the next unit. `stop()` restores
