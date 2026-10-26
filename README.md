@@ -167,12 +167,12 @@ getgenv().halloweenFarm.stop()
 print(getgenv().halloweenFarm.stats.knocks, getgenv().halloweenFarm.stats.candy)
 ```
 
-## Quirk Auto Farm (Prodigy / Fortune's Favor hunter)
+## Quirk Auto Farm (any quirk as target)
 
 [`quirk-auto-farm.luau`](./quirk-auto-farm.luau) spams the **Quirk machine** on your
-**Common-rarity** units until each one lands the chosen target quirk — **Prodigy** or
-**Fortune's Favor** (selectable via dropdown). On a hit it pings a **Discord webhook**
-and moves to the next unit.
+**Common-rarity** units until each one lands the chosen target quirk — **every quirk in the
+game is selectable** (20 of them, listed from rarest to most common). On a hit it sends a
+**Discord notification** and moves to the next unit.
 
 ### Protection model (why units never get stuck)
 
@@ -193,9 +193,15 @@ uses **one protected quirk only — the target**:
    keeps being rolled (that's the "only hold the chosen quirk" rule). Each one is logged
    and counted as `rareLost`.
 
-Odds per roll (total pool weight 5556): **Prodigy = 2/5556 ≈ 1/2778**,
-**Fortune's Favor = 0.5/5556 ≈ 1/11112**. A full rotation over every Common unit is
-expected to take hours — this is an idle farm.
+Odds per roll (total pool weight 5556): **Sovereign = 0.15/5556 ≈ 1/37,041**,
+**Fortune's Favor ≈ 1/11,112**, **Midas Touch ≈ 1/5,556**, **Prodigy = 2/5556 ≈ 1/2,778**,
+**Tycoon ≈ 1/2,222**, then the tier-III quirks at `10/5556 ≈ 1/556`. A full rotation over
+every Common unit is expected to take hours — this is an idle farm.
+
+Only quirks with `weight < 100` can be **protected** by the server (the ten rarest). The
+ten tier-II/I quirks are still selectable as a target so you can farm them, but the
+dropdown and the dashboard both warn: a hit will be found and counted, then rerolled in a
+later session because the server refuses to hold it.
 
 The roll (`QuirkService.RE.Roll`) takes the unit key only and is re-validated by the
 server with a **0.2s debounce** — the script keeps a 0.25s interval. The server
@@ -224,7 +230,7 @@ The script opens a **[Rayfield Gen 2](https://docs.sirius.menu/rayfield-gen2)** 
 
 | Element | What it does |
 |---|---|
-| **Target Quirk** dropdown | `Prodigy` (default) or `Fortune's Favor`; re-applies protections + blacklist immediately when switched while running |
+| **Target Quirk** dropdown | all 20 quirks, rarest first (`Prodigy` is the default); warns when the pick has `weight >= 100` because the server refuses to protect those. Re-applies protections + blacklist immediately when switched while running |
 | **Auto Farm Quirk** toggle | ON starts (protect target → blacklist → roll), OFF stops and restores the old protection map |
 | **Blacklist unit langka** toggle | ON = units already holding a rare quirk (`weight < 100`) at start are skipped for the whole session |
 | **Stats** | 3 lines: `rolls · accepted · hits` / `rare dibuang · money spent` / `current unit · target` |
@@ -283,6 +289,9 @@ Notes:
   window, then builds exactly one new window.
 - Only official remotes are fired (`Roll` with the unit key, `SetQuirkProtected`) —
   no force flag, no memory/state patching.
+- The target list is built from the game's own `Quirks` config when the script loads, so
+  new quirks show up automatically; a v803 snapshot is used only if that module cannot be
+  required.
 - Tested against `[🎃] Anime Dice` v803.
 
 ### Remote control from the web dashboard

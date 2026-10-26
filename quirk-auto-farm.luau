@@ -1,6 +1,6 @@
---// Anime Dice — Quirk Auto Farm (Prodigy / Fortune's Favor hunter) \\--
+--// Anime Dice — Quirk Auto Farm (semua quirk bisa jadi target) \\--
 -- Me-roll mesin Quirk di unit Common milik player sampai tiap unit mendapat
--- quirk target (Prodigy atau Fortune's Favor). Server QUIRKSERVICE:
+-- quirk target (pilih dari semua quirk di dropdown). Server QUIRKSERVICE:
 --   • Roll: Network.QuirkService.RE.Roll — FireServer(unitKey) SAJA.
 --     Argumen kedua (force=true) melewati proteksi — DILARANG dipakai script ini.
 --   • Proteksi: Network.QuirkService.RE.SetQuirkProtected — FireServer(quirk, bool).
@@ -28,7 +28,9 @@
 -- Konsekuensi yang diterima: quirk langka non-target yang MENDARAT SELAMA FARM
 -- akan di-reroll dan hilang (dihitung di stats.rareLost + log).
 --
--- Odds: Prodigy weight 2 (≈1/2778), Fortune's Favor weight 0.5 (≈1/11112).
+-- Odds: total weight pool ≈ 5556. Sovereign 0.15 (≈1/37.041), Fortune's Favor 0.5
+-- (≈1/11.112), Midas Touch 1 (≈1/5.556), Prodigy 2 (≈1/2.778), Tycoon 2.5, lalu
+-- tier III weight 10. Quirk weight >= 100 bisa dicari tapi tidak bisa diproteksi.
 -- Script INI MEMAKAI UANG IN-GAME — AUTO_START = false, start manual saja.
 --
 -- Usage : loadstring(readfile("quirk-auto-farm.luau"))()
@@ -44,8 +46,8 @@
 --             start()        -- true = berjalan, false = gagal (recoverable)
 --             stop()         -- hentikan loop + pulihkan snapshot proteksi
 --             isRunning()    -- status running sekarang
---             setTarget(name)-- "Prodigy" | "Fortune's Favor"; proteksi + blacklist
---                               langsung diterapkan ulang bila sedang berjalan
+--             setTarget(name)-- nama quirk apa pun dari config game; proteksi +
+--                               blacklist langsung diterapkan ulang bila berjalan
 --             blacklist      -- set unitKey -> true (unit yang tidak boleh di-reroll)
 --             rebuildBlacklist() -- hitung ulang blacklist dari inventori sekarang
 --             pullConfig()   -- tarik config dari dashboard sekarang (true, code | false, err)
@@ -260,6 +262,88 @@ local function isRareQuirk(name)
 	return type(cfg) == "table" and type(cfg.weight) == "number" and cfg.weight < 100
 end
 
+-- Semua quirk dari config game, urut paling langka -> paling umum. Dipakai untuk
+-- isi dropdown dan validasi target. Fallback = snapshot v803 kalau require gagal.
+local FALLBACK_QUIRKS = {
+	{ name = "Sovereign", weight = 0.15 },
+	{ name = "Fortune's Favor", weight = 0.5 },
+	{ name = "Midas Touch", weight = 1 },
+	{ name = "Prodigy", weight = 2 },
+	{ name = "Tycoon", weight = 2.5 },
+	{ name = "Fortune III", weight = 10 },
+	{ name = "Gifted III", weight = 10 },
+	{ name = "Refined III", weight = 10 },
+	{ name = "Swift III", weight = 10 },
+	{ name = "Wealth III", weight = 10 },
+	{ name = "Fortune II", weight = 100 },
+	{ name = "Gifted II", weight = 100 },
+	{ name = "Refined II", weight = 100 },
+	{ name = "Swift II", weight = 100 },
+	{ name = "Wealth II", weight = 100 },
+	{ name = "Fortune I", weight = 1000 },
+	{ name = "Gifted I", weight = 1000 },
+	{ name = "Refined I", weight = 1000 },
+	{ name = "Swift I", weight = 1000 },
+	{ name = "Wealth I", weight = 1000 },
+}
+
+local quirkListCache
+local function quirkOptions()
+	if quirkListCache then
+		return quirkListCache
+	end
+	local list = {}
+	local quirks = getQuirks()
+	if quirks then
+		for name, cfg in pairs(quirks) do
+			if type(cfg) == "table" and type(cfg.weight) == "number" then
+				list[#list + 1] = { name = name, weight = cfg.weight }
+			end
+		end
+	end
+	if #list == 0 then
+		for _, entry in ipairs(FALLBACK_QUIRKS) do
+			list[#list + 1] = { name = entry.name, weight = entry.weight }
+		end
+	end
+	table.sort(list, function(a, b)
+		if a.weight ~= b.weight then
+			return a.weight < b.weight
+		end
+		return a.name < b.name
+	end)
+	quirkListCache = list
+	return list
+end
+
+local function quirkWeight(name)
+	for _, option in ipairs(quirkOptions()) do
+		if option.name == name then
+			return option.weight
+		end
+	end
+	return nil
+end
+
+local function isKnownQuirk(name)
+	return type(name) == "string" and quirkWeight(name) ~= nil
+end
+
+-- Server menolak SetQuirkProtected untuk weight >= 100, jadi target seperti itu
+-- tetap bisa dicari tapi tidak akan tertahan.
+local function canProtectQuirk(name)
+	local weight = quirkWeight(name)
+	return weight ~= nil and weight < 100
+end
+
+local function quirkNames()
+	local names = {}
+	for _, option in ipairs(quirkOptions()) do
+		names[#names + 1] = option.name
+	end
+	return names
+end
+
 -- Map proteksi global (nama quirk -> boolean) dibaca live dari data client.
 local function protectedMap()
 	local ok, map = pcall(function()
@@ -319,7 +403,9 @@ local function applyProtections(target)
 			desired[name] = (name == target)
 		end
 	end
-	desired[target] = true
+	if canProtectQuirk(target) then
+		desired[target] = true
+	end
 
 	for name, want in pairs(desired) do
 		if isProtected(name) ~= want then
@@ -373,7 +459,7 @@ local function restoreProtections()
 		end
 	end
 	local target = state.targetQuirk
-	if not isProtected(target) then
+	if canProtectQuirk(target) and not isProtected(target) then
 		fireProtect(target, true)
 	end
 	log("proteksi dipulihkan")
@@ -816,9 +902,17 @@ local function start()
 	task.spawn(mainLoop, id)
 	syncToggle(true) -- toggle ON dua-argumen tanpa callback -> tidak re-enter stop()
 	notify("Quirk Farm", string.format(
-		"Farming dimulai — target %s (diproteksi), %d unit di-blacklist", state.targetQuirk, blacklisted
+		"Farming dimulai — target %s%s, %d unit di-blacklist",
+		state.targetQuirk,
+		canProtectQuirk(state.targetQuirk) and " (diproteksi)" or " (tidak bisa diproteksi)",
+		blacklisted
 	))
-	log(string.format("aktif — target %s diproteksi, rare lain dilepas, blacklist %d unit", state.targetQuirk, blacklisted))
+	log(string.format(
+		"aktif — target %s%s, rare lain dilepas, blacklist %d unit",
+		state.targetQuirk,
+		canProtectQuirk(state.targetQuirk) and " diproteksi" or " (proteksi tidak tersedia)",
+		blacklisted
+	))
 	return true
 end
 
@@ -931,7 +1025,7 @@ local function applyRemoteConfig(cfg)
 	local ignored = {}
 	local ok, err = pcall(function()
 		if cfg.target ~= nil then
-			if type(cfg.target) == "string" and isRareQuirk(cfg.target) then
+			if type(cfg.target) == "string" and isKnownQuirk(cfg.target) then
 				if cfg.target ~= state.targetQuirk then
 					local api = ENV.quirkFarm
 					local applied = type(api) == "table" and type(api.setTarget) == "function"
@@ -1192,9 +1286,12 @@ ENV.quirkFarm = {
 	testHit = testHit,
 	remote = remoteInfo,
 	setTarget = function(name)
-		if name ~= "Prodigy" and name ~= "Fortune's Favor" then
-			log("WARN: setTarget ditolak, target tidak dikenal: " .. tostring(name))
+		if not isKnownQuirk(name) then
+			log("WARN: setTarget ditolak, quirk tidak dikenal: " .. tostring(name))
 			return false
+		end
+		if not canProtectQuirk(name) then
+			log("WARN: " .. name .. " (weight " .. tostring(quirkWeight(name)) .. ") tidak bisa diproteksi server (butuh < 100) - hit tidak akan ditahan")
 		end
 		state.targetQuirk = name
 		-- Sinkron dropdown TANPA callback (dua argumen Set) -> tidak re-enter.
@@ -1259,20 +1356,24 @@ if Rayfield then
 		-- table bahkan di single mode — jangan pernah membaca .value sebagai string.
 		targetDropdown = tab:CreateDropdown({
 			name = "Target Quirk",
-			description = "Prodigy (~1/2778) atau Fortune's Favor (~1/11112). Langsung diterapkan bila farm sedang jalan.",
-			options = { "Prodigy", "Fortune's Favor" },
-			value = "Prodigy",
+			description = "Semua quirk tersedia, urut dari paling langka. Yang weight >= 100 tidak bisa diproteksi server. Langsung diterapkan bila farm sedang jalan.",
+			options = quirkNames(),
+			value = state.targetQuirk,
 			forgetState = true, -- tidak ada persistensi target antar load
 			callback = function(selected)
-				if selected == "Prodigy" or selected == "Fortune's Favor" then
-					state.targetQuirk = selected
-					if state.running then
-						local blacklisted = rebuildBlacklist()
-						applyProtections(selected)
-						log(string.format("target -> %s (proteksi & blacklist diterapkan, %d unit blacklist)", selected, blacklisted))
-					else
-						log("target diganti -> " .. selected .. " (diterapkan saat start berikutnya)")
-					end
+				if not isKnownQuirk(selected) then
+					return
+				end
+				if not canProtectQuirk(selected) then
+					log("WARN: " .. selected .. " tidak bisa diproteksi (weight >= 100) - hit tidak ditahan")
+				end
+				state.targetQuirk = selected
+				if state.running then
+					local blacklisted = rebuildBlacklist()
+					applyProtections(selected)
+					log(string.format("target -> %s (proteksi & blacklist diterapkan, %d unit blacklist)", selected, blacklisted))
+				else
+					log("target diganti -> " .. selected .. " (diterapkan saat start berikutnya)")
 				end
 			end,
 		})
