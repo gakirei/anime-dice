@@ -123,6 +123,7 @@ do
 	WEBHOOK_URL = trimHook(candidate)
 end
 local STUCK_LIMIT = 10 -- ambigu berturut-turut (quirk tak berubah + uang tak turun) sebelum unit dilewati; 10 menutup roll sukses yang kebetulan mendarat di quirk sama (~0.18^10)
+local EARLY_ABORT_UNITS = 3 -- unit berturut-turut ditolak tanpa satu pun accepted -> farm stop (indikasi di luar zona)
 local PROTECT_SETTLE_TIMEOUT = 3 -- detik menunggu replikasi SetQuirkProtected dikonfirmasi client
 local BLACKLIST_RARE_UNITS = true -- blacklist unit lama yang sudah pegang quirk langka (weight < 100) selain target
 
@@ -711,7 +712,7 @@ local function processCandidate(id, cand)
 			refusals += 1
 			if refusals >= state.stuckLimit then
 				log("WARN: unit stuck (data tidak terbaca?), skip: " .. cand.name)
-				return
+				return "REFUSED"
 			end
 			task.wait(state.rollInterval)
 			continue
@@ -764,7 +765,7 @@ local function processCandidate(id, cand)
 			notifyHit(cand.name, state.targetQuirk)
 			log(string.format("HIT: %s dapat %s (rolls=%d hits=%d)", cand.name, state.targetQuirk, stats.rolls, stats.hits))
 			notify("Quirk Farm", cand.name .. " dapat " .. state.targetQuirk .. "!")
-			return
+			return "HIT"
 		end
 
 		-- Dual-signal "roll diterima server": quirk unit BERUBAH adalah sinyal
@@ -790,7 +791,7 @@ local function processCandidate(id, cand)
 			refusals += 1
 			if refusals >= state.stuckLimit then
 				log("WARN: unit stuck (di luar zona / protected / debounce?), skip: " .. cand.name)
-				return
+				return "REFUSED"
 			end
 		end
 		updateStatsText(cand.name)
@@ -815,6 +816,7 @@ local function mainLoop(id)
 			return
 		end
 		local acceptedBefore = stats.accepted
+		local refusedStreak = 0
 		for _, cand in ipairs(candidates) do
 			if not (state.running and id == runId) then
 				return
@@ -824,6 +826,17 @@ local function mainLoop(id)
 			if outcome == "STOP" then
 				stop()
 				return
+			end
+			if outcome == "REFUSED" then
+				refusedStreak += 1
+				if stats.accepted == acceptedBefore and refusedStreak >= EARLY_ABORT_UNITS then
+					log(string.format("WARN: %d unit ditolak berturut-turut tanpa satu roll pun diterima - farm dihentikan", refusedStreak))
+					notify("Quirk Farm", "Tidak ada roll yang diterima server. Berdiri di area mesin Quirk (zona Quirks), lalu start lagi.")
+					stop()
+					return
+				end
+			else
+				refusedStreak = 0
 			end
 		end
 		if state.running and id == runId and stats.accepted == acceptedBefore then

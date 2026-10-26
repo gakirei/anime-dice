@@ -210,7 +210,7 @@ server with a **0.2s debounce** — the script keeps a 0.25s interval. The serve
 | Refusal | Server check | Script behavior |
 |---|---|---|
 | Protected quirk | unit's current quirk name is in `ProtectedQuirks` (global per quirk name) | only the target stays protected, so target holders are excluded and every other unit stays rollable |
-| Out of range | `AntiCheatService.IsNearZone(player, "Quirks")` | a full rotation with zero accepted rolls auto-stops the farm with a notification (no infinite spin) |
+| Out of range | `AntiCheatService.IsNearZone(player, "Quirks")` | three units in a row hitting the stuck limit with zero accepted rolls stops the farm immediately with a notification (measured: ~20s instead of a full rotation) |
 | Insufficient funds | money < roll cost | farm stops with a notification |
 | Debounce | last roll < 0.2s ago | interval is always respected |
 
@@ -283,7 +283,8 @@ Notes:
   5–2000 depending on the unit).
 - Keep your character near the **Quirk machine** while farming. Rolls are accepted from a
   fairly loose range (verified ~31 studs from the zone center), but if the server stops
-  accepting them the farm auto-stops after one empty rotation instead of spinning.
+  accepting them the farm stops after three refused units instead of spinning
+  (verified: 99 studs away → 30 rolls, 0 accepted, stopped after ~20s).
 - Units already holding the **target** quirk are excluded from candidates. Units holding a
   rare quirk are excluded too *while the blacklist is on* — with it off, their quirk can
   be rerolled away.
