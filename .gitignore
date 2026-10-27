@@ -1,0 +1,8 @@
+# Dependencies
+node_modules/
+
+# Agent session state
+.omo/
+
+# The dashboard lives in its own repository (anime-dice-dashboard)
+web/
