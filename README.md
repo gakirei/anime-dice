@@ -457,3 +457,114 @@ Notes:
   (never the webhook URL) and can spoof the telemetry numbers. They cannot change config,
   stop the farm, or post to your webhook beyond the 15s rate limit. To tighten later, set
   a sync key on the device — the function already accepts `x-sync-key` when present.
+
+## All-in-one hub (Collector + Quirk Farm)
+
+[`quirk-auto-farm.luau`](./quirk-auto-farm.luau) is now the single-window hub. The
+existing Quirk Farm is unchanged; a **Collector** tab was added that snapshots the
+account's owned resources and POSTs them to the dashboard ingest function.
+
+| Tab | Element | What it does |
+|---|---|---|
+| Collector | **Auto Sync** toggle | ON = snapshot on profile load and every `COLLECTOR.INTERVAL` (120 s). OFF = manual only |
+| Collector | **Sync sekarang** | fires one snapshot immediately (works with Auto Sync OFF) |
+| Collector | **status / items** | last HTTP result, age, and a per-kind item count (`Token 5 · Boost 12 · …`) |
+| Collector | **Sync key** textbox + **Simpan Sync Key** | applies immediately and persists to `collector_sync_key.txt` (same pattern as the webhook field) |
+
+Snapshots are read-only — the collector never fires a game remote. Payload shape is
+unchanged from `web/public/collector.luau`: `{ account, place, items, stats }`, with
+`Boost` and `Gear` nested by rarity and every other kind flat. Units are not indexed.
+
+Three collector bugs were fixed during the port:
+
+- **Gear double count.** An equipped piece also exists in its inventory stack
+  (verified v809: `Pumpkin Head` x1 in `Inventory` + `Head` slot), so the equipped
+  slot is only counted when the name is not already stacked.
+- **Non-finite stats.** `money`/`rolls`/`rebirth` are dropped when they are `inf`/`NaN`
+  instead of poisoning the JSON body.
+- **Hung HTTP.** The POST runs in its own thread with a 20 s deadline, so one stalled
+  `request` can no longer leave the sync loop permanently "busy".
+
+Console API:
+
+```lua
+getgenv().animeDiceHub.collector.sync()        -- force a snapshot now
+getgenv().animeDiceHub.collector.status()      -- { enabled, running, lastAt, lastOk, lastCode, summary, keySet }
+getgenv().animeDiceHub.collector.setKey("adsk_...")
+getgenv().animeDiceHub.collector.setEnabled(false)
+getgenv().AnimeDiceSync()                      -- legacy alias
+```
+
+> Do not run the standalone `collector.luau` at the same time as the hub — both would
+> sync the same account and you would get duplicate interval traffic.
+
+## Tower control (web → game)
+
+The hub can farm towers from the dashboard. The browser writes `public.tower_controls`,
+the script polls it every 15 s and drives the run; telemetry goes back every 30 s.
+
+| Direction | Path | Cadence |
+|---|---|---|
+| Browser → Supabase | PostgREST write to `public.tower_controls.config` (RLS: `owner_id = auth.uid()`) | on Save / Start / Stop (`rev` bumps) |
+| Script → Supabase | `POST /functions/v1/tower` `{action:"pull", userId}` | every 15 s, applies only when `rev` changed |
+| Script → Supabase | `POST /functions/v1/tower` `{action:"status", userId, status}` | every 30 s (server enforces 5 s) |
+| Script → Supabase | `POST /functions/v1/tower` `{action:"event", userId, kind, …}` on clear/defeat | server relays the Discord embed (30 s floor) |
+| Supabase → Browser | realtime on `tower_controls` (15 s polling fallback) | live |
+
+### How the script drives it (and why)
+
+The game's own `TowerController` is the **only** caller of `CompleteTowerFloor`. Its floor
+loop is already running after a start; the server accepts at most one call per sequence, so
+a second caller would make the controller read "empty" five times and cancel the tower. The
+hub therefore:
+
+1. starts through `TowerController.startTower(name)` (the game's own flow, animations and
+   reward handling), never through a duplicated floor loop;
+2. uses only the official remotes for everything else — `SetAutoTower`,
+   `EquipBestTowerTeam`, `CancelTower`;
+3. wraps `TowerController.startTower` in the module table so the **automatic restart that
+   follows `CancelTower`** (~3 s later) can be vetoed. Without that guard `Stop` never
+   sticks — the game restarts the tower at floor 1;
+4. keeps a 1 s monitor: `Hidden.Visible` / `Screen.Visible` is "in tower", `Floor.Text` is
+   the floor. An end is classified after 2 s without the pill (the restart fires at 3 s), and
+   an open menu is ignored because it hides the pill while the run continues.
+
+A cancel requested by the web (Stop, or switching tower) is **not** counted as a defeat and
+does not fire a Discord event. Runs that reach `maxFloors` count as **clears**; anything else
+counts as a **defeat**. With "Retry after defeat" on, the script re-equips the best team and
+restarts the same tower after `retryDelay` seconds.
+
+### Web card
+
+`Tower farm` on the account detail page:
+
+| Element | What it does |
+|---|---|
+| Tower dropdown | all 14 towers, grouped Halloween event / permanent, with floor counts |
+| Start farm / Stop farm | writes `config.running`; the script applies it on the next pull |
+| Auto-equip best team | `EquipBestTowerTeam` (server sorts units by damage, slots 1–4) before each start |
+| Retry after defeat + delay | restart the same tower, 3–300 s delay |
+| Discord on defeat / clear | relayed by the edge function; the webhook URL never reaches the client |
+| Status panel | Live/Stale, tower, floor/max, attempts, defeats, clears, team, applied rev |
+
+The in-game **Tower** tab is read-only (status, team, `Tarik config sekarang`, manual
+`Equip Best`) so the dashboard stays the single source of truth.
+
+### Setup
+
+1. Run `web/supabase/migrations/20261027000000_tower_control.sql` in the Supabase SQL editor.
+2. Deploy the function: `supabase functions deploy tower --no-verify-jwt`.
+3. Open the account's Tower card and press **Save** once — that creates the row. Before it
+   exists, `pull` returns `config: null` and `status`/`event` answer `404 not registered`.
+
+Console API:
+
+```lua
+getgenv().animeDiceHub.tower.state()      -- intent, running, floor, target, attempts, defeats, clears, appliedRev
+getgenv().animeDiceHub.tower.pull()       -- pull config now
+getgenv().animeDiceHub.tower.start("Attic")
+getgenv().animeDiceHub.tower.stop()
+getgenv().animeDiceHub.tower.equipBest()
+getgenv().animeDiceHub.tower.status()     -- push status now
+```
+

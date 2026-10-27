@@ -35,7 +35,7 @@
 --
 -- Usage : loadstring(readfile("quirk-auto-farm.luau"))()
 -- UI    : LightScriptHub — GUI LOKAL (tanpa HttpGet/dependensi jaringan), SATU window
---           "QUIRK AUTO FARM" dengan tab Farm / Info / Misc: dropdown target, toggle
+--           "ANIME DICE HUB" dengan tab Farm / Collector / Info / Misc: dropdown target, toggle
 --           Auto Farm Quirk, toggle Blacklist unit langka, stats live, anti-AFK.
 --           Toggle ON = start, OFF = stop. AUTO_START = false: tidak jalan otomatis.
 --           Bila pembuatan GUI gagal, script TETAP jalan tanpa UI (headless) —
@@ -58,6 +58,12 @@
 --             teleportToMachine() -- pindah ke mesin pakai chunked teleport (juga saat stop)
 --             antiAfk()      -- { enabled, guarded }: status guard rejoin AFK game (18 menit)
 --             remote         -- { enabled, keySet, lastError, lastPullAt, appliedRev }
+-- Collector (tab Collector) : snapshot resource milik akun -> Supabase ingest.
+--             Auto sync saat profil siap + tiap COLLECTOR.INTERVAL detik, plus
+--             hotkey RightControl. READ-ONLY: tidak pernah mengirim remote game.
+--             Key disimpan di "collector_sync_key.txt" (atau getgenv().ANIME_DICE_SYNC_KEY).
+--             API: getgenv().animeDiceHub.collector.{sync,status,setKey,setEnabled,setInterval}
+--                  getgenv().AnimeDiceSync()
 -- Remote : OPEN CHANNEL — sync key TIDAK wajib, jadi device tidak menyimpan rahasia.
 --          Kalau key diisi, ia tetap dikirim sebagai x-sync-key (opsional, untuk
 --          pengetatan nanti): getgenv().QUIRK_SYNC_KEY -> REMOTE_CONFIG.SYNC_KEY ->
@@ -81,6 +87,21 @@ end
 -- (1a) Loop remote generasi lama (bila ada) keluar lewat generation token —
 -- stop() tidak menyentuhnya, jadi tanpa ini re-run bisa meninggalkan poller kedua.
 ENV.__quirkFarmRemoteGen = (tonumber(ENV.__quirkFarmRemoteGen) or 0) + 1
+
+-- (1b) Collector: kill the old generation's loop/hotkey. Bumping the token makes
+--      collectSync() from stale closures inert; the UIS connection is dropped
+--      explicitly so re-runs do not stack listeners.
+ENV.__adHubCollectorGen = (tonumber(ENV.__adHubCollectorGen) or 0) + 1
+if ENV.__adHubCollectorConn then
+	pcall(function()
+		ENV.__adHubCollectorConn:Disconnect()
+	end)
+	ENV.__adHubCollectorConn = nil
+end
+
+-- (1c) Tower: stop the old pull/monitor loop. An active tower run is NOT
+--      cancelled here — a re-run must adopt it, not lose the floor progress.
+ENV.__adHubTowerGen = (tonumber(ENV.__adHubTowerGen) or 0) + 1
 
 -- (2) GUI generasi lama tidak perlu ditutup manual di sini: blok UI di jalur load
 --     menghancurkan ScreenGui bernama "LightScriptHub" lebih dulu (nama unik, jadi
@@ -153,6 +174,74 @@ local REMOTE_CONFIG = {
 	SYNC_KEY     = "",   -- empty = disabled (local-only mode); fill from the dashboard
 	POLL         = 15,   -- seconds between config pulls
 	STATUS_EVERY = 30,   -- seconds between status pushes
+}
+
+--// Collector: owned-resource snapshot -> Supabase ingest \\--
+-- Ported from web/public/collector.luau (stage 1 of the dashboard pipeline).
+-- READ-ONLY: reads the client profile and POSTs JSON; never fires a game remote.
+-- Payload shape is frozen (the ingest edge function lives outside this repo):
+--   { account = { userId, username, displayName },
+--     place   = { placeId, gameId, jobId },
+--     items   = <kind -> name -> amount, Boost/Gear nested by rarity>,
+--     stats   = { money, rolls, rebirth } }
+-- Boost (potions) and Gear are grouped by rarity; every other kind is flat.
+-- Units are intentionally NOT indexed.
+local COLLECTOR = {
+	ENABLED        = true, -- auto sync on load + every INTERVAL seconds
+	URL            = "https://rlbmftsefonfdqfhyjij.supabase.co/functions/v1/ingest",
+	ANON_KEY       = "", -- only needed if the edge function has JWT verification on
+	INTERVAL       = 120,
+	HTTP_TIMEOUT   = 20, -- a hung request must never wedge the sync loop
+	HOTKEY         = Enum.KeyCode.RightControl,
+	SYNC_KEY       = "", -- dashboard-injected copy may fill this; the UI writes the file instead
+	RARITY_GROUPED = { Boost = true, Gear = true },
+}
+
+-- Key order: getgenv() override -> constant above -> file in the executor workspace.
+-- Never commit a real key: the dashboard's copy button injects it at copy time.
+local COLLECTOR_SYNC_KEY = ""
+do
+	local function trim(value)
+		return (tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+	local sources = {
+		function()
+			return ENV.ANIME_DICE_SYNC_KEY
+		end,
+		function()
+			return COLLECTOR.SYNC_KEY
+		end,
+		function()
+			if type(readfile) ~= "function" then
+				return nil
+			end
+			local ok, data = pcall(readfile, "collector_sync_key.txt")
+			return (ok and type(data) == "string") and data or nil
+		end,
+	}
+	for _, read in ipairs(sources) do
+		local ok, value = pcall(read)
+		local key = ok and trim(value) or ""
+		if key ~= "" then
+			COLLECTOR_SYNC_KEY = key
+			break
+		end
+	end
+end
+
+--// Tower remote control (web -> game) \\--
+-- The web dashboard writes public.tower_controls.config; this module polls it
+-- and drives the tower through the game's OWN TowerController plus the official
+-- remotes. It NEVER calls CompleteTowerFloor: the controller already loops that
+-- remote, and the server answers at most once per sequence. Calling it from here
+-- too makes the controller read "empty" five times and cancel the tower.
+local TOWER_REMOTE = {
+	ENABLED      = true,
+	URL          = "https://rlbmftsefonfdqfhyjij.supabase.co/functions/v1/tower",
+	POLL         = 15, -- seconds between config pulls
+	STATUS_EVERY = 30, -- seconds between status pushes
+	END_GRACE    = 2,  -- seconds without the in-tower pill before a run counts as ended (the game restarts at 3s)
+	VERSION      = "tower-1.0.0",
 }
 
 --// Sync key resolution (key TIDAK pernah di-log / ditulis ke disk) \\--
@@ -644,12 +733,19 @@ end
 --// Webhook \\--
 -- HTTP POST lintas-executor (request/http_request/syn/fluxus/krnl/HttpService)
 -- untuk Discord — pola yang sama dengan anime-dice-all-in-one.luau.
-local function httpPost(url, payload)
+local function httpPost(url, payload, extraHeaders, breakOnStatus)
 	local okEnc, body = pcall(function()
 		return HttpService:JSONEncode(payload)
 	end)
 	if not okEnc then
 		return false, "JSONEncode: " .. tostring(body)
+	end
+
+	local headers = { ["Content-Type"] = "application/json" }
+	if type(extraHeaders) == "table" then
+		for name, value in pairs(extraHeaders) do
+			headers[name] = value
+		end
 	end
 
 	local candidates = {}
@@ -685,12 +781,27 @@ local function httpPost(url, payload)
 		local ok, res = pcall(c.fn, {
 			Url = url,
 			Method = "POST",
-			Headers = { ["Content-Type"] = "application/json" },
+			Headers = headers,
 			Body = body,
 		})
 		if ok and type(res) == "table" then
 			local code = res.StatusCode or res.status or res.Status
-			if res.Success == true or (type(code) == "number" and code >= 200 and code < 300) then
+			local is2xx = type(code) == "number" and code >= 200 and code < 300
+			if is2xx then
+				if breakOnStatus then
+					return true, code
+				end
+				return true, c.name .. " " .. tostring(code or "")
+			end
+			-- breakOnStatus: the transport worked, so a non-2xx is a real server
+			-- answer. Retrying through another backend would POST twice.
+			if breakOnStatus and type(code) == "number" then
+				return false, code
+			end
+			if res.Success == true then
+				if breakOnStatus then
+					return true, code
+				end
 				return true, c.name .. " " .. tostring(code or "")
 			end
 			lastErr = c.name .. " HTTP " .. tostring(code)
@@ -699,6 +810,83 @@ local function httpPost(url, payload)
 		end
 	end
 	return false, tostring(lastErr)
+end
+
+-- Same transports as httpPost, but returns the decoded JSON body. The tower
+-- channel needs it because `pull` carries the config in the response.
+local function httpPostJson(url, payload, extraHeaders)
+	local okEnc, body = pcall(function()
+		return HttpService:JSONEncode(payload)
+	end)
+	if not okEnc then
+		return false, "JSONEncode: " .. tostring(body), nil
+	end
+
+	local headers = { ["Content-Type"] = "application/json" }
+	if type(extraHeaders) == "table" then
+		for name, value in pairs(extraHeaders) do
+			headers[name] = value
+		end
+	end
+
+	local candidates = {}
+	local function add(name, f)
+		if type(f) == "function" then
+			table.insert(candidates, { name = name, fn = f })
+		end
+	end
+	for _, n in ipairs({ "request", "http_request", "http_post", "HttpPost", "httpRequest" }) do
+		add(n, ENV[n])
+		if ENV ~= _G then
+			add(n, _G[n])
+		end
+	end
+	if type(syn) == "table" then
+		add("syn.request", syn.request)
+	end
+	if type(http) == "table" then
+		add("http.request", http.request)
+	end
+	if type(fluxus) == "table" then
+		add("fluxus.request", fluxus.request)
+	end
+	if type(krnl) == "table" then
+		add("krnl.request", krnl.request)
+	end
+	add("HttpService:RequestAsync", function(opts)
+		return HttpService:RequestAsync(opts)
+	end)
+
+	for _, c in ipairs(candidates) do
+		local ok, res = pcall(c.fn, {
+			Url = url,
+			Method = "POST",
+			Headers = headers,
+			Body = body,
+		})
+		if ok and type(res) == "table" then
+			local code = res.StatusCode or res.status or res.Status
+			if type(code) == "number" and code >= 200 and code < 300 then
+				if type(res.Body) == "string" and res.Body ~= "" then
+					local okDec, decoded = pcall(function()
+						return HttpService:JSONDecode(res.Body)
+					end)
+					if okDec then
+						return true, decoded, code
+					end
+				end
+				return true, nil, code
+			end
+			-- Transport worked: a non-2xx is a real answer, do not POST twice.
+			if type(code) == "number" then
+				return false, code, code
+			end
+			if res.Success == true then
+				return true, nil, code
+			end
+		end
+	end
+	return false, "no http transport", nil
 end
 
 local function getWebhookUrl()
@@ -746,6 +934,954 @@ end
 -- notifyHit = satu-satunya jalur notifikasi HIT. Default-nya webhook lokal; di
 -- bawah nanti di-reassign ke relay server (device tidak pernah pegang URL webhook).
 local notifyHit = sendWebhook
+
+--// Collector core \\--
+-- Snapshot is built from the client profile only; nothing is fired at the server.
+local collectData -- Packages.Data.Client
+local collectLookup -- name -> { kind, rarity }
+local collectStatusLabel -- UI handle: Set(text) (nil = headless)
+local collectKeyBox -- UI handle
+local collectToggle -- UI handle
+local collectGen = 0 -- generation token, set on the load path below
+local collectRuntime = {
+	running = false,
+	enabled = COLLECTOR.ENABLED,
+	interval = COLLECTOR.INTERVAL,
+	lastAt = 0,
+	lastCode = nil,
+	lastOk = nil,
+	lastSummary = "-",
+	warnedKey = false,
+}
+
+local function collectLog(msg)
+	print("[Collector] " .. tostring(msg))
+end
+
+local function collectTrim(value)
+	return (tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function collectRequireData()
+	if collectData then
+		return collectData
+	end
+	local ok, mod = pcall(function()
+		return require(RS.Packages.Data.Client)
+	end)
+	if ok and type(mod) == "table" then
+		collectData = mod
+		return mod
+	end
+	return nil
+end
+
+-- hasLoaded is a plain boolean on Packages.Data.Client (verified v809); the
+-- callable form is kept for older builds.
+local function collectLoaded(timeout)
+	local data = collectRequireData()
+	if not data then
+		return false
+	end
+	local deadline = os.clock() + (timeout or 30)
+	repeat
+		local okProp, prop = pcall(function()
+			return data.hasLoaded
+		end)
+		if okProp and prop == true then
+			return true
+		end
+		local okFn, value = pcall(function()
+			return (type(data.hasLoaded) == "function") and data.hasLoaded()
+		end)
+		if okFn and value == true then
+			return true
+		end
+		task.wait(0.25)
+	until os.clock() > deadline
+	return false
+end
+
+-- Profile payloads are wrapped once in a reactive node (.___X) in v809.
+local function collectUnwrap(value, depth)
+	depth = depth or 0
+	if depth > 6 then
+		return value
+	end
+	if type(value) == "table" and value.___X ~= nil then
+		return collectUnwrap(value.___X, depth + 1)
+	end
+	return value
+end
+
+local function collectRoot()
+	local data = collectRequireData()
+	if not data then
+		return nil
+	end
+	local ok, root = pcall(function()
+		return collectUnwrap(data.data)
+	end)
+	if ok and type(root) == "table" then
+		return root
+	end
+	return nil
+end
+
+-- Unit instances are keyed by UUID; stacks are keyed by item name.
+local function collectIsUuid(key)
+	return type(key) == "string" and #key == 36 and key:find("-", 1, true) ~= nil
+end
+
+-- Short-scale suffixes so string-encoded currencies survive.
+local COLLECT_SUFFIX = {
+	k = 1e3, m = 1e6, b = 1e9, t = 1e12,
+	qa = 1e15, qi = 1e18, sx = 1e21, sp = 1e24, oc = 1e27, no = 1e30,
+	dc = 1e33, ud = 1e36, dd = 1e39, td = 1e42,
+	qad = 1e45, qid = 1e48, sxd = 1e51, spd = 1e54,
+	ocd = 1e57, nod = 1e60, vg = 1e63,
+}
+
+-- JSON has no Infinity/NaN: drop them or the server rejects the whole body.
+local function collectFinite(value)
+	if type(value) ~= "number" then
+		return nil
+	end
+	if value ~= value or value == math.huge or value == -math.huge then
+		return nil
+	end
+	return value
+end
+
+local function collectToNumber(value)
+	if type(value) == "number" then
+		return collectFinite(value)
+	end
+	if type(value) ~= "string" then
+		return nil
+	end
+	local direct = tonumber(value)
+	if direct then
+		return collectFinite(direct)
+	end
+	local numberPart, suffix = value:match("^([%d%.]+)%s*(%a*)$")
+	if not numberPart then
+		return nil
+	end
+	local base = tonumber(numberPart)
+	if not base then
+		return nil
+	end
+	if suffix == "" then
+		return collectFinite(base)
+	end
+	local multiplier = COLLECT_SUFFIX[suffix:lower()]
+	if not multiplier then
+		return nil
+	end
+	return collectFinite(base * multiplier)
+end
+
+-- EntryRegistry:getEntryConfig / :entriesOfKind are unreliable in this build
+-- (verified: getEntryConfig("Gems") = nil), so the map comes from allEntries().
+local function collectBuildLookup()
+	local map = {}
+	local ok, registry = pcall(function()
+		return require(RS.Framework.Features.Inventory.EntryRegistry)
+	end)
+	if not ok or type(registry) ~= "table" then
+		return map
+	end
+	local okAll, all = pcall(function()
+		return registry:allEntries()
+	end)
+	if not okAll or type(all) ~= "table" then
+		return map
+	end
+	for id, cfg in pairs(all) do
+		if type(cfg) == "table" and cfg.kind then
+			map[id] = { kind = cfg.kind, rarity = cfg.rarity }
+		end
+	end
+	return map
+end
+
+local function collectSummarize(items)
+	local parts = {}
+	for kind, value in pairs(items) do
+		local count = 0
+		if type(value) == "table" then
+			if COLLECTOR.RARITY_GROUPED[kind] then
+				for _, bucket in pairs(value) do
+					if type(bucket) == "table" then
+						for _ in pairs(bucket) do
+							count = count + 1
+						end
+					end
+				end
+			else
+				for _ in pairs(value) do
+					count = count + 1
+				end
+			end
+		end
+		if count > 0 then
+			table.insert(parts, kind .. " " .. count)
+		end
+	end
+	table.sort(parts)
+	if #parts == 0 then
+		return "kosong"
+	end
+	return table.concat(parts, " · ")
+end
+
+local function collectBuildItems()
+	local items = {}
+	local gearStacked = {}
+	local lookup = collectLookup or {}
+
+	local function add(kind, name, amount, rarity)
+		if type(name) ~= "string" or name == "" then
+			return
+		end
+		local value = collectToNumber(amount) or 1
+		if value <= 0 then
+			return
+		end
+		if COLLECTOR.RARITY_GROUPED[kind] then
+			local bucket = rarity or "Unknown"
+			items[kind] = items[kind] or {}
+			items[kind][bucket] = items[kind][bucket] or {}
+			items[kind][bucket][name] = (items[kind][bucket][name] or 0) + value
+		else
+			items[kind] = items[kind] or {}
+			items[kind][name] = (items[kind][name] or 0) + value
+		end
+	end
+
+	local root = collectRoot()
+	if not root then
+		return items
+	end
+
+	-- 1) Inventory: name-keyed entries are stacks, UUID-keyed are unit instances
+	--    (units are deliberately not indexed).
+	local inventory = collectUnwrap(root.Inventory)
+	if type(inventory) == "table" then
+		for key, entry in pairs(inventory) do
+			if type(entry) == "table" then
+				local name = entry.name or entry.id or key
+				local info = lookup[name]
+				if info and info.kind == "Unit" then
+					-- skip units
+				elseif info then
+					add(info.kind, name, entry.amount or 1, info.rarity)
+					if info.kind == "Gear" then
+						gearStacked[name] = true
+					end
+				elseif not collectIsUuid(key) then
+					add("Consumable", name, entry.amount or 1)
+				end
+			elseif not collectIsUuid(key) then
+				add("Consumable", key, entry)
+			end
+		end
+	end
+
+	-- 2) Gamepasses
+	local passes = collectUnwrap(root.OwnedGamepasses)
+	if type(passes) == "table" then
+		for name, owned in pairs(passes) do
+			if owned then
+				add("Gamepass", name, 1)
+			end
+		end
+	end
+
+	-- 3) Currently used dice
+	local dice = collectUnwrap(root.Dice)
+	if type(dice) == "string" and dice ~= "" then
+		add("Dice", dice, 1)
+	end
+
+	-- 4) Equipped gear. The equipped piece is still in its inventory stack
+	--    (verified v809: "Pumpkin Head" x1 in Inventory + Head slot), so adding
+	--    the slot again would double it. Only add pieces that are not stacked.
+	local equipped = collectUnwrap(root.EquippedGear)
+	if type(equipped) == "table" then
+		for _slot, item in pairs(equipped) do
+			local name = (type(item) == "table" and (item.name or item.id)) or item
+			if type(name) == "string" and not gearStacked[name] then
+				local info = lookup[name]
+				add((info and info.kind) or "Gear", name, 1, info and info.rarity)
+			end
+		end
+	end
+
+	return items
+end
+
+local function collectBuildStats()
+	local root = collectRoot()
+	if not root then
+		return {}
+	end
+	return {
+		money = collectToNumber(collectUnwrap(root.Money)),
+		rolls = collectToNumber(collectUnwrap(root.Rolls)),
+		rebirth = collectToNumber(collectUnwrap(root.Rebirth)),
+	}
+end
+
+local function collectBuildPayload()
+	local items = collectBuildItems()
+	return {
+		account = {
+			userId = LocalPlayer.UserId,
+			username = LocalPlayer.Name,
+			displayName = LocalPlayer.DisplayName,
+		},
+		place = { placeId = game.PlaceId, gameId = game.GameId, jobId = game.JobId },
+		items = items,
+		stats = collectBuildStats(),
+	}, items
+end
+
+local function collectPost(payload)
+	local headers = {}
+	if COLLECTOR_SYNC_KEY ~= "" then
+		headers["x-sync-key"] = COLLECTOR_SYNC_KEY
+	end
+	if COLLECTOR.ANON_KEY ~= "" then
+		headers["Authorization"] = "Bearer " .. COLLECTOR.ANON_KEY
+	end
+	return httpPost(COLLECTOR.URL, payload, headers, true)
+end
+
+local function collectUpdateStatus()
+	if not collectStatusLabel then
+		return
+	end
+	pcall(function()
+		local code = collectRuntime.lastCode
+		local last
+		if collectRuntime.lastAt <= 0 then
+			last = "belum pernah"
+		else
+			last = string.format("%ds lalu", math.floor(os.clock() - collectRuntime.lastAt))
+		end
+		local state
+		if collectRuntime.running then
+			state = "syncing..."
+		elseif code == nil then
+			state = "-"
+		elseif type(code) == "number" and code >= 200 and code < 300 then
+			state = "OK HTTP " .. tostring(code)
+		elseif code == 401 then
+			state = "HTTP 401 — sync key kosong/salah"
+		else
+			state = "gagal: " .. tostring(code)
+		end
+		collectStatusLabel:Set(string.format(
+			"status: %s (%s)\nitems: %s\nkey: %s · auto: %s",
+			state,
+			last,
+			tostring(collectRuntime.lastSummary or "-"),
+			COLLECTOR_SYNC_KEY ~= "" and "ada" or "kosong",
+			collectRuntime.enabled and "ON" or "OFF"
+		))
+	end)
+end
+
+-- Blocking and time-bounded. The POST runs in its own thread so a hung transport
+-- cannot wedge the interval loop forever (Delta's request can stall).
+local function collectSyncOnce()
+	if not collectRequireData() then
+		return false, "modul data tidak tersedia"
+	end
+	if not collectLoaded(30) then
+		return false, "profil belum siap"
+	end
+	if not collectLookup or next(collectLookup) == nil then
+		collectLookup = collectBuildLookup()
+	end
+	local payload, items = collectBuildPayload()
+	collectRuntime.lastSummary = collectSummarize(items)
+
+	local finished, ok, code = false, false, nil
+	task.spawn(function()
+		local postOk, postCode = collectPost(payload)
+		ok, code = postOk, postCode
+		finished = true
+	end)
+	local deadline = os.clock() + COLLECTOR.HTTP_TIMEOUT
+	while not finished and os.clock() < deadline do
+		task.wait(0.1)
+	end
+	if not finished then
+		return false, "timeout"
+	end
+	return ok, code
+end
+
+local function collectSync(reason, force)
+	if collectGen ~= (tonumber(ENV.__adHubCollectorGen) or 0) then
+		return false
+	end
+	if collectRuntime.running then
+		return false
+	end
+	if not collectRuntime.enabled and not force then
+		return false
+	end
+	if COLLECTOR_SYNC_KEY == "" then
+		if not collectRuntime.warnedKey then
+			collectRuntime.warnedKey = true
+			collectLog("sync key kosong — auto sync idle. Isi dari tab Collector (atau dashboard).")
+			collectUpdateStatus()
+		end
+		return false
+	end
+	collectRuntime.running = true
+	task.spawn(function()
+		local ok, code = collectSyncOnce()
+		collectRuntime.running = false
+		collectRuntime.lastAt = os.clock()
+		collectRuntime.lastOk = ok
+		collectRuntime.lastCode = code
+		if ok then
+			collectLog(string.format("synced (%s) HTTP %s", tostring(reason), tostring(code)))
+		else
+			collectLog(string.format("sync failed (%s): %s", tostring(reason), tostring(code)))
+		end
+		collectUpdateStatus()
+	end)
+	return true
+end
+
+-- Shared by the UI button and the console API.
+local function collectSetKey(key, persist)
+	key = collectTrim(key)
+	if key ~= "" and not key:match("^adsk_%x+$") then
+		return false, "format sync key tidak valid (adsk_<hex>)"
+	end
+	COLLECTOR_SYNC_KEY = key
+	if collectKeyBox then
+		pcall(function()
+			collectKeyBox:Set(key)
+		end)
+	end
+	if persist and type(writefile) == "function" then
+		local ok = pcall(writefile, "collector_sync_key.txt", key)
+		if not ok then
+			return true, "berlaku sesi ini — gagal menulis collector_sync_key.txt"
+		end
+	end
+	return true
+end
+
+--// Tower core \\--
+-- READ-ONLY against the game except for the official tower actions: PlayTower
+-- via TowerController, CancelTower, SetAutoTower, EquipBestTowerTeam.
+local towerData -- controller / uiRefs / towers / remotes
+local towerStatusLabel -- UI handle (nil = headless)
+local towerGen = 0
+local towerRuntime = {
+	config = nil,
+	appliedRev = 0,
+	intent = false,
+	target = nil,
+	activeTower = nil,
+	actualRunning = false,
+	floor = 0,
+	maxFloors = nil,
+	attempts = 0,
+	defeats = 0,
+	clears = 0,
+	team = "",
+	equipBest = true,
+	retry = true,
+	retryDelay = 5,
+	pendingStartAt = 0,
+	endStreak = 0,
+	lastPullAt = 0,
+	lastStatusAt = 0,
+	notRegistered = false,
+	suppressUntil = 0,
+	suppressEnds = 0,
+	starting = false,
+}
+
+local function towerLog(msg)
+	print("[Tower] " .. tostring(msg))
+end
+
+-- Lazy: the tower modules may not be loaded yet on a very early execute.
+-- A partial result is not cached, so a later call retries the require.
+local function towerDeps()
+	if towerData then
+		return towerData
+	end
+	local okController, controller = pcall(function()
+		return require(RS.Framework.Features.Towers.TowerController)
+	end)
+	local okUi, uiRefs = pcall(function()
+		return require(RS.Framework.Features.UI.UIReferences)
+	end)
+	local okTowers, towers = pcall(function()
+		return require(RS.Framework.Features.Towers.Towers)
+	end)
+
+	local network = RS:FindFirstChild("Network")
+	local service = network and network:FindFirstChild("Towers")
+	local events = service and service:FindFirstChild("RE")
+	local functions = service and service:FindFirstChild("RF")
+
+	local deps = {
+		controller = okController and type(controller) == "table" and controller or nil,
+		uiRefs = okUi and type(uiRefs) == "table" and uiRefs or nil,
+		towers = okTowers and type(towers) == "table" and towers or nil,
+		setAuto = events and events:FindFirstChild("SetAutoTower") or nil,
+		equipBest = events and events:FindFirstChild("EquipBestTowerTeam") or nil,
+		cancelTower = functions and functions:FindFirstChild("CancelTower") or nil,
+	}
+	if deps.controller and deps.towers and deps.uiRefs then
+		towerData = deps
+	end
+	return deps
+end
+
+-- The game's own battle screen is the only reliable "in tower" signal:
+-- Hidden.Visible stays true for the whole run (hidden or shown), Screen.Visible
+-- is true while the battle view is up. Floor.Text keeps the last floor.
+local function towerGameState()
+	local deps = towerDeps()
+	if not deps.uiRefs then
+		return false, 0
+	end
+	local root = deps.uiRefs.Root
+	local towerUi = root and root:FindFirstChild("Tower")
+	if not towerUi then
+		return false, 0
+	end
+	local hidden = towerUi:FindFirstChild("Hidden")
+	local screen = towerUi:FindFirstChild("Screen")
+	local running = (hidden and hidden.Visible == true) or (screen and screen.Visible == true) or false
+	local floor = 0
+	if screen then
+		local floorLabel = screen:FindFirstChild("Floor")
+		if floorLabel then
+			local ok, text = pcall(function()
+				return floorLabel.Text
+			end)
+			if ok then
+				floor = tonumber(tostring(text):match("(%d+)")) or 0
+			end
+		end
+	end
+	return running, floor
+end
+
+local function towerMaxFloors(name)
+	local deps = towerDeps()
+	if not deps.towers or type(name) ~= "string" or name == "" then
+		return nil
+	end
+	local ok, config = pcall(function()
+		return deps.towers.Get(name)
+	end)
+	if ok and type(config) == "table" and type(config.maxFloors) == "number" then
+		return config.maxFloors
+	end
+	return nil
+end
+
+local function towerTeamSummary()
+	local data = collectRequireData()
+	if not data then
+		return ""
+	end
+	local ok, root = pcall(function()
+		return collectUnwrap(data.data)
+	end)
+	if not ok or type(root) ~= "table" then
+		return ""
+	end
+	local team = collectUnwrap(root.TowerTeam)
+	local inventory = collectUnwrap(root.Inventory)
+	if type(team) ~= "table" then
+		return ""
+	end
+	local names = {}
+	for index = 1, 4 do
+		local unitId = team[index]
+		if type(unitId) == "string" then
+			local entry = type(inventory) == "table" and inventory[unitId] or nil
+			local name = (type(entry) == "table" and entry.name) or unitId
+			table.insert(names, tostring(name))
+		end
+	end
+	return table.concat(names, ", ")
+end
+
+local function towerFireAuto(name)
+	local deps = towerDeps()
+	if deps.setAuto and deps.setAuto:IsA("RemoteEvent") then
+		pcall(function()
+			deps.setAuto:FireServer(name)
+		end)
+	end
+end
+
+local function towerEquipBest()
+	local deps = towerDeps()
+	if deps.equipBest and deps.equipBest:IsA("RemoteEvent") then
+		pcall(function()
+			deps.equipBest:FireServer()
+		end)
+		return true
+	end
+	return false
+end
+
+local function towerCancel()
+	local deps = towerDeps()
+	if deps.cancelTower and deps.cancelTower:IsA("RemoteFunction") then
+		local ok, result = pcall(function()
+			return deps.cancelTower:InvokeServer()
+		end)
+		return ok and result == true
+	end
+	return false
+end
+
+-- A menu hides the in-tower pill while the run continues; without this guard a
+-- long menu visit would be read as "run ended".
+local function towerMenuOpen()
+	local ok, menu = pcall(function()
+		return require(RS.Framework.Features.UI.MenuController)
+	end)
+	if not ok or type(menu) ~= "table" or type(menu.ActiveMenu) ~= "function" then
+		return false
+	end
+	local okCall, active = pcall(function()
+		return menu.ActiveMenu()
+	end)
+	return okCall and active ~= nil
+end
+
+-- The controller's auto-restart re-calls startTower through the module table
+-- (`v_u_41.startTower`), so replacing that field lets us veto a restart we did
+-- not ask for. Without this, CancelTower is followed by an automatic restart
+-- ~3s later and "Stop" from the web never sticks.
+local function towerInstallGuard()
+	local deps = towerDeps()
+	if not deps.controller or deps.guarded then
+		return deps.guarded == true
+	end
+	local original = deps.controller.startTower
+	if type(original) ~= "function" then
+		return false
+	end
+	deps.originalStart = original
+	deps.guarded = true
+	deps.controller.startTower = function(name)
+		if towerRuntime.starting then
+			return original(name)
+		end
+		-- Only veto the automatic restart that follows our own cancel. A real
+		-- click on the in-game Fight button is still allowed.
+		if os.clock() < (towerRuntime.suppressUntil or 0) then
+			towerLog("guard: veto auto-restart")
+			return false
+		end
+		return original(name)
+	end
+	return true
+end
+
+-- Start through the game's controller so its own floor loop, animations and
+-- reward handling stay the single driver. `startTower` returns false when a
+-- tower is already active, so cancel and retry a few times before giving up.
+local function towerStart(name)
+	if type(name) ~= "string" or name == "" then
+		return false, "tower tidak valid"
+	end
+	local deps = towerDeps()
+	if not deps.controller or type(deps.controller.startTower) ~= "function" then
+		return false, "controller tidak tersedia"
+	end
+	towerInstallGuard()
+	local start = deps.originalStart or deps.controller.startTower
+	-- Persist the target so the game resumes it on the next join too.
+	towerFireAuto(name)
+	for _ = 1, 3 do
+		towerRuntime.starting = true
+		local ok, started = pcall(start, name)
+		towerRuntime.starting = false
+		if ok and started == true then
+			towerRuntime.activeTower = name
+			towerRuntime.attempts += 1
+			towerRuntime.intent = true
+			towerRuntime.maxFloors = towerMaxFloors(name)
+			towerRuntime.floor = 0
+			towerRuntime.endStreak = 0
+			-- Keep the restart veto briefly so the old run's delayed restart is
+			-- still refused; after that a normal end is classified again.
+			towerRuntime.suppressUntil = os.clock() + 4
+			return true
+		end
+		towerCancel()
+		task.wait(1.5)
+	end
+	return false, "gagal start"
+end
+
+local function towerStop(silent)
+	towerRuntime.intent = false
+	towerRuntime.pendingStartAt = 0
+	towerFireAuto(false)
+	local cancelled = towerCancel()
+	-- Only a real cancel ends a run; marking it unconditionally could swallow a
+	-- natural clear that finished moments earlier.
+	if cancelled then
+		towerRuntime.suppressUntil = os.clock() + 15
+		towerRuntime.suppressEnds += 1
+	end
+	if not silent then
+		towerLog("stop diminta (cancel=" .. tostring(cancelled) .. ")")
+	end
+	return cancelled
+end
+
+local function towerRequest(action, payload)
+	if not TOWER_REMOTE.ENABLED then
+		return false, "disabled", nil
+	end
+	local body = {}
+	for key, value in pairs(payload or {}) do
+		body[key] = value
+	end
+	body.action = action
+	body.userId = LocalPlayer.UserId
+	return httpPostJson(TOWER_REMOTE.URL, body, nil)
+end
+
+local function towerUpdateLabel()
+	if not towerStatusLabel then
+		return
+	end
+	pcall(function()
+		local running = towerGameState()
+		local maxFloors = towerRuntime.maxFloors
+		local floorText = tostring(towerRuntime.floor)
+		if maxFloors then
+			floorText = floorText .. "/" .. tostring(maxFloors)
+		end
+		towerStatusLabel:Set(string.format(
+			"tower: %s · %s\nfloor: %s · attempts: %d\ndefeats: %d · clears: %d · rev: %d\nteam: %s",
+			tostring(towerRuntime.activeTower or towerRuntime.target or "-"),
+			running and "running" or "stopped",
+			floorText,
+			towerRuntime.attempts,
+			towerRuntime.defeats,
+			towerRuntime.clears,
+			towerRuntime.appliedRev,
+			towerRuntime.team ~= "" and towerRuntime.team or "-"
+		))
+	end)
+end
+
+local function towerSendEvent(kind, towerName)
+	-- The webhook itself stays server-side; these flags only decide whether the
+	-- event is sent at all.
+	local config = towerRuntime.config
+	if type(config) == "table" then
+		if kind == "complete" and config.notifyComplete == false then
+			return
+		elseif kind == "defeat" and config.notifyDefeat == false then
+			return
+		end
+	end
+	local ok, decoded, code = towerRequest("event", {
+		kind = kind,
+		tower = towerName,
+		floor = towerRuntime.floor,
+		maxFloors = towerRuntime.maxFloors or 0,
+		attempts = towerRuntime.attempts,
+		player = LocalPlayer.Name,
+	})
+	if ok and type(decoded) == "table" then
+		towerLog(string.format("event %s terkirim (delivered=%s)", kind, tostring(decoded.delivered)))
+	else
+		towerLog(string.format("event %s gagal (%s)", kind, tostring(code)))
+	end
+end
+
+local function towerPushStatus(force)
+	if not TOWER_REMOTE.ENABLED then
+		return false
+	end
+	local now = os.clock()
+	if not force and now - towerRuntime.lastStatusAt < TOWER_REMOTE.STATUS_EVERY then
+		return false
+	end
+	towerRuntime.lastStatusAt = now
+	towerRuntime.team = towerTeamSummary()
+	local running = towerGameState()
+	local ok, _, code = towerRequest("status", {
+		status = {
+			running = running,
+			tower = towerRuntime.activeTower or towerRuntime.target or "",
+			floor = towerRuntime.floor,
+			maxFloors = towerRuntime.maxFloors or 0,
+			attempts = towerRuntime.attempts,
+			defeats = towerRuntime.defeats,
+			clears = towerRuntime.clears,
+			team = towerRuntime.team,
+			appliedRev = towerRuntime.appliedRev,
+			lastSeenAt = os.time(),
+			version = TOWER_REMOTE.VERSION,
+		},
+	})
+	if not ok and code == 404 and not towerRuntime.notRegistered then
+		towerRuntime.notRegistered = true
+		towerLog("status 404 — akun belum terdaftar di dashboard (buka kartu Tower lalu Save)")
+	end
+	towerUpdateLabel()
+	return ok
+end
+
+local function towerApplyConfig(config)
+	local target = towerRuntime.target
+	if type(config.tower) == "string" and config.tower ~= "" then
+		target = config.tower
+	end
+	local wantRunning = config.running == true
+	towerRuntime.config = config
+	towerRuntime.appliedRev = tonumber(config.rev) or 0
+	towerRuntime.target = target
+	towerRuntime.equipBest = config.equipBest == true
+	towerRuntime.retry = config.retry == true
+	towerRuntime.retryDelay = math.clamp(tonumber(config.retryDelay) or 5, 3, 300)
+	towerRuntime.notRegistered = false
+
+	local running = towerGameState()
+	if not wantRunning then
+		towerStop(true)
+		towerLog("stop (rev " .. tostring(towerRuntime.appliedRev) .. ")")
+		return
+	end
+
+	towerRuntime.intent = true
+	if not target then
+		towerLog("config running=true tapi target tower kosong")
+		return
+	end
+	towerFireAuto(target)
+	if towerRuntime.equipBest then
+		towerEquipBest()
+		task.wait(1)
+	end
+	if running and towerRuntime.activeTower == target then
+		towerLog("sudah berjalan di " .. target)
+		return
+	end
+	if running then
+		local cancelled = towerCancel()
+		if cancelled then
+			towerRuntime.suppressUntil = os.clock() + 15
+			towerRuntime.suppressEnds += 1
+		end
+		task.wait(2)
+	end
+	local ok = towerStart(target)
+	towerLog(string.format(
+		"start %s -> %s (rev %d)", target, tostring(ok), towerRuntime.appliedRev
+	))
+end
+
+local function towerPull()
+	local ok, decoded, code = towerRequest("pull", {})
+	if not ok then
+		return false, code
+	end
+	local config = type(decoded) == "table" and decoded.config or nil
+	if type(config) ~= "table" then
+		return true, "no config"
+	end
+	local rev = tonumber(config.rev) or 0
+	if rev == towerRuntime.appliedRev then
+		return true, "up to date"
+	end
+	towerApplyConfig(config)
+	return true, "applied rev " .. tostring(rev)
+end
+
+-- One tick per second: track the floor, detect the end of a run, classify it,
+-- fire the Discord event and schedule the retry.
+local function towerMonitorTick()
+	local running, floor = towerGameState()
+	if floor > 0 then
+		towerRuntime.floor = floor
+	end
+	if running then
+		towerRuntime.actualRunning = true
+		towerRuntime.endStreak = 0
+	elseif towerRuntime.actualRunning and towerMenuOpen() then
+		-- The pill is hidden by an open menu; the run is still alive.
+		towerRuntime.endStreak = 0
+	elseif towerRuntime.actualRunning then
+		towerRuntime.endStreak += 1
+		if towerRuntime.endStreak >= TOWER_REMOTE.END_GRACE then
+			towerRuntime.actualRunning = false
+			towerRuntime.endStreak = 0
+			if towerRuntime.suppressEnds > 0 then
+				towerRuntime.suppressEnds -= 1
+				towerRuntime.floor = 0
+				towerLog("run dihentikan (cancel terjadwal, bukan defeat)")
+				towerUpdateLabel()
+				return
+			end
+			local towerName = towerRuntime.activeTower or towerRuntime.target or "?"
+			local maxFloors = towerRuntime.maxFloors or towerMaxFloors(towerName)
+			local cleared = maxFloors ~= nil and towerRuntime.floor >= maxFloors
+			if cleared then
+				towerRuntime.clears += 1
+			else
+				towerRuntime.defeats += 1
+			end
+			towerLog(string.format(
+				"selesai %s floor %d%s",
+				towerName, towerRuntime.floor, cleared and " (clear)" or " (defeat)"
+			))
+			towerSendEvent(cleared and "complete" or "defeat", towerName)
+			towerPushStatus(true)
+			if towerRuntime.intent and towerRuntime.retry and towerRuntime.target then
+				towerRuntime.pendingStartAt = os.clock() + towerRuntime.retryDelay
+			end
+		end
+	else
+		towerRuntime.endStreak = 0
+	end
+
+	if towerRuntime.pendingStartAt > 0 and os.clock() >= towerRuntime.pendingStartAt then
+		towerRuntime.pendingStartAt = 0
+		if towerRuntime.intent and towerRuntime.target then
+			local stillRunning = towerGameState()
+			if not stillRunning then
+				if towerRuntime.equipBest then
+					towerEquipBest()
+					task.wait(0.8)
+				end
+				towerStart(towerRuntime.target)
+			end
+		end
+	end
+
+	towerUpdateLabel()
+end
 
 --// Farm loop \\--
 -- Snapshot inventory -> filter unit Common yang quirknya BELUM target, tidak
@@ -1713,6 +2849,172 @@ ENV.quirkFarm = {
 	webhookUrl = WEBHOOK_URL, -- field override runtime: ENV.quirkFarm.webhookUrl = "https://..."
 }
 
+--// Collector load path: generation token, first snapshot, interval loop, hotkey \\--
+collectGen = tonumber(ENV.__adHubCollectorGen) or 0
+
+ENV.animeDiceHub = {
+	quirkFarm = ENV.quirkFarm,
+	collector = {
+		sync = function(reason)
+			return collectSync(reason or "api", true)
+		end,
+		status = function()
+			return {
+				enabled = collectRuntime.enabled,
+				running = collectRuntime.running,
+				lastAt = collectRuntime.lastAt,
+				lastOk = collectRuntime.lastOk,
+				lastCode = collectRuntime.lastCode,
+				summary = collectRuntime.lastSummary,
+				keySet = COLLECTOR_SYNC_KEY ~= "",
+			}
+		end,
+		setKey = function(key)
+			return collectSetKey(key, true)
+		end,
+		setEnabled = function(value)
+			collectRuntime.enabled = value == true
+			if collectToggle then
+				pcall(function()
+					collectToggle:Set(collectRuntime.enabled, true)
+				end)
+			end
+			if collectRuntime.enabled then
+				collectSync("enabled")
+			end
+			collectUpdateStatus()
+		end,
+		setInterval = function(seconds)
+			local value = tonumber(seconds)
+			if not value or value < 15 then
+				return false
+			end
+			collectRuntime.interval = value
+			return true
+		end,
+		buildLookup = function()
+			collectLookup = collectBuildLookup()
+			return collectLookup
+		end,
+	},
+}
+
+ENV.AnimeDiceSync = function(reason)
+	return collectSync(reason or "api", true)
+end
+if ENV ~= _G then
+	_G.AnimeDiceSync = ENV.AnimeDiceSync
+end
+
+task.spawn(function()
+	local data = collectRequireData()
+	if data then
+		collectLoaded(60)
+	end
+	collectLookup = collectBuildLookup()
+	if collectRuntime.enabled then
+		collectSync("load")
+	end
+	while collectGen == (tonumber(ENV.__adHubCollectorGen) or 0) do
+		task.wait(collectRuntime.interval)
+		if collectGen ~= (tonumber(ENV.__adHubCollectorGen) or 0) then
+			break
+		end
+		if collectRuntime.enabled then
+			collectSync("interval")
+		end
+	end
+end)
+
+do
+	local InputService = game:GetService("UserInputService")
+	ENV.__adHubCollectorConn = InputService.InputBegan:Connect(function(input, processed)
+		if processed then
+			return
+		end
+		if collectGen ~= (tonumber(ENV.__adHubCollectorGen) or 0) then
+			return
+		end
+		if input.KeyCode == COLLECTOR.HOTKEY then
+			collectSync("hotkey", true)
+		end
+	end)
+end
+
+--// Tower load path: web config pull + 1s monitor + status push \\--
+towerGen = tonumber(ENV.__adHubTowerGen) or 0
+
+ENV.animeDiceHub.tower = {
+	pull = function()
+		return towerPull()
+	end,
+	status = function()
+		return towerPushStatus(true)
+	end,
+	start = function(name)
+		return towerStart(name or towerRuntime.target or "Attic")
+	end,
+	stop = function()
+		return towerStop(false)
+	end,
+	equipBest = function()
+		return towerEquipBest()
+	end,
+	state = function()
+		local running, floor = towerGameState()
+		return {
+			intent = towerRuntime.intent,
+			running = running,
+			floor = floor,
+			target = towerRuntime.target,
+			activeTower = towerRuntime.activeTower,
+			attempts = towerRuntime.attempts,
+			defeats = towerRuntime.defeats,
+			clears = towerRuntime.clears,
+			appliedRev = towerRuntime.appliedRev,
+			notRegistered = towerRuntime.notRegistered,
+			team = towerRuntime.team,
+			guardInstalled = towerData ~= nil and towerData.guarded == true,
+			suppressUntil = towerRuntime.suppressUntil,
+		}
+	end,
+}
+
+task.spawn(function()
+	towerInstallGuard()
+	-- The game auto-starts profile.AutoTower on join. Adopt that run instead of
+	-- cancelling it, so a web config with the same target is a no-op.
+	task.wait(3)
+	if towerGameState() then
+		local data = collectRequireData()
+		local ok, root = pcall(function()
+			return collectUnwrap(data.data)
+		end)
+		if ok and type(root) == "table" then
+			local auto = collectUnwrap(root.AutoTower)
+			if type(auto) == "string" and auto ~= "" then
+				towerRuntime.activeTower = auto
+				towerRuntime.target = auto
+				towerRuntime.maxFloors = towerMaxFloors(auto)
+				towerRuntime.intent = true
+				towerLog("adopt run yang sudah jalan: " .. auto)
+			end
+		end
+	end
+
+	while towerGen == (tonumber(ENV.__adHubTowerGen) or 0) do
+		towerPull()
+		towerPushStatus(false)
+		for _ = 1, TOWER_REMOTE.POLL do
+			if towerGen ~= (tonumber(ENV.__adHubTowerGen) or 0) then
+				return
+			end
+			towerMonitorTick()
+			task.wait(1)
+		end
+	end
+end)
+
 --// UI: LightScriptHub — GUI LOKAL (tanpa HttpGet), dibangun SEKALI di jalur load \\--
 -- Semua pembuatan elemen di dalam satu pcall: kegagalan UI tidak boleh membunuh
 -- logika headless (start/stop via getgenv().quirkFarm tetap hidup).
@@ -2024,7 +3326,7 @@ do
 		TitleLabel.Size = UDim2.new(1, -80, 1, 0)
 		TitleLabel.Position = UDim2.new(0, 12, 0, 0)
 		TitleLabel.BackgroundTransparency = 1
-		TitleLabel.Text = "QUIRK AUTO FARM"
+		TitleLabel.Text = "ANIME DICE HUB"
 		TitleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
 		TitleLabel.Font = Enum.Font.GothamBold
 		TitleLabel.TextSize = 13
@@ -2571,6 +3873,8 @@ do
 
 		-- // Tab Farm //
 		local FarmPage = CreateTab("Farm")
+		local CollectorPage = CreateTab("Collector")
+		local TowerPage = CreateTab("Tower")
 		local InfoPage = CreateTab("Info")
 		local MiscPage = CreateTab("Misc")
 
@@ -2623,6 +3927,82 @@ do
 		statsText = CreateStatsLabel(FarmPage,
 			"rolls: 0 · accepted: 0 · hits: 0\nrare dibuang: 0 · money spent: 0\ncurrent: - · target: " .. tostring(state.targetQuirk))
 
+		-- // Tab Collector //
+		CreateLabel(CollectorPage, "Resource Sync (Supabase)")
+
+		collectToggle = CreateToggle(CollectorPage, "Auto Sync", collectRuntime.enabled, function(value)
+			collectRuntime.enabled = value
+			if value then
+				collectSync("enabled")
+			end
+			collectUpdateStatus()
+			notify("Collector", value and "Auto sync ON" or "Auto sync OFF")
+		end)
+
+		CreateButton(CollectorPage, "Sync sekarang", function()
+			local started = collectSync("manual", true)
+			notify("Collector", started and "Sync dimulai — cek status di bawah" or "Sync tidak bisa dimulai (sedang jalan / key kosong)")
+		end)
+
+		collectStatusLabel = CreateStatsLabel(
+			CollectorPage,
+			"status: -\nitems: -\nkey: "
+				.. (COLLECTOR_SYNC_KEY ~= "" and "ada" or "kosong")
+				.. " · auto: "
+				.. (collectRuntime.enabled and "ON" or "OFF")
+		)
+
+		CreateLabel(CollectorPage, "Sync Key")
+		collectKeyBox = CreateTextBox(
+			CollectorPage,
+			"adsk_... (disimpan ke collector_sync_key.txt)",
+			"adsk_...",
+			COLLECTOR_SYNC_KEY
+		)
+
+		CreateButton(CollectorPage, "Simpan Sync Key", function()
+			local ok, message = collectSetKey(collectKeyBox:Get(), true)
+			if not ok then
+				notify("Sync Key", message)
+				return
+			end
+			if type(writefile) ~= "function" then
+				notify("Sync Key", "Berlaku sesi ini — executor tidak punya writefile")
+			elseif message then
+				notify("Sync Key", message)
+			else
+				notify("Sync Key", COLLECTOR_SYNC_KEY == "" and "Key dikosongkan" or "Key disimpan")
+			end
+			collectRuntime.warnedKey = false
+			if collectRuntime.enabled and COLLECTOR_SYNC_KEY ~= "" then
+				collectSync("key saved", true)
+			end
+			collectUpdateStatus()
+		end)
+
+		CreateLabel(CollectorPage, "Account")
+		CreateLabel(CollectorPage, string.format("%s · userId %d · v%d", LocalPlayer.Name, LocalPlayer.UserId, game.PlaceVersion))
+
+		-- // Tab Tower //
+		CreateLabel(TowerPage, "Tower Farm (kontrol dari web)")
+		CreateLabel(TowerPage, "Target, Start/Stop, tim, retry, dan Discord diatur di dashboard.")
+
+		towerStatusLabel = CreateStatsLabel(
+			TowerPage,
+			"tower: - · stopped\nfloor: 0 · attempts: 0\ndefeats: 0 · clears: 0 · rev: 0\nteam: -"
+		)
+
+		CreateButton(TowerPage, "Tarik config sekarang", function()
+			local ok, info = towerPull()
+			notify("Tower", ok and ("config: " .. tostring(info)) or ("gagal: " .. tostring(info)))
+			towerUpdateLabel()
+		end)
+
+		CreateButton(TowerPage, "Equip Best (manual)", function()
+			local ok = towerEquipBest()
+			notify("Tower", ok and "Equip best dikirim" or "remote EquipBest tidak tersedia")
+		end)
+
 		-- // Tab Info //
 		CreateLabel(InfoPage, "Status Runtime")
 
@@ -2662,6 +4042,8 @@ do
 						tostring(isRunning()),
 						tostring(state.targetQuirk)
 					))
+					collectUpdateStatus()
+					towerUpdateLabel()
 				end)
 				task.wait(2)
 			end
@@ -2761,7 +4143,7 @@ do
 			end
 		end)
 
-		CreateNotification("Quirk Farm Siap", "Pilih target lalu nyalakan Auto Farm di tab Farm.", 4)
+		CreateNotification("Anime Dice Hub Siap", "Collector sync + Quirk Farm dalam satu window.", 4)
 	end)
 	if not okUI then
 		-- Jangan tinggalkan GUI setengah jadi; handle di-reset supaya farm tetap headless.
