@@ -317,12 +317,23 @@ getgenv().quirkFarm.setTarget("Fortune's Favor")
 getgenv().quirkFarm.rebuildBlacklist()
 ```
 
-Discord webhook: **nothing is hardcoded** (the repo is public) and, with the remote channel on,
-**nothing webhook-related is on the device either** — the dashboard stores the URL in Supabase
-and the server posts the embed. The device only falls back to a local URL if the relay itself
-fails, resolved in this order (first non-empty wins):
+Discord webhook: **nothing is hardcoded** (the repo is public). There are two ways to get
+HIT notifications:
 
-1. `getgenv().quirkFarm.webhookUrl` at runtime,
+1. **Dashboard (server-side).** With the remote channel on, the URL is stored in Supabase and
+   the **server** posts the embed — the URL never reaches the game client. Nothing
+   webhook-related is on the device in this mode.
+2. **In-game (local).** **Misc → Discord Webhook** has a textbox plus **Simpan Webhook**.
+   Paste the URL, press save: it applies immediately and is written to
+   `webhook_url.txt` in the executor workspace, so the next time the script loads the field
+   is already filled and you do not have to type it again. Saving an empty field deletes it
+   (the file is emptied). If the executor has no `writefile`, it still applies for the
+   current session and the toast says so.
+
+The local URL is resolved in this order (first non-empty wins) and is used whenever the
+relay is unavailable **or** the server has no webhook stored (`delivered=false`):
+
+1. `getgenv().quirkFarm.webhookUrl` at runtime (this is what the textbox sets),
 2. `getgenv().QUIRK_WEBHOOK` set before loading the script,
 3. a `webhook_url.txt` file in the executor workspace.
 
@@ -330,8 +341,9 @@ fails, resolved in this order (first non-empty wins):
 getgenv().quirkFarm.webhookUrl = "https://discord.com/api/webhooks/..."
 ```
 
-With no local webhook, a failed relay is simply logged. The URL is never logged and never
-written to disk by the script.
+The UI accepts only `https://discord.com/api/webhooks/...` (and the legacy
+`discordapp.com` host) and rejects anything else with a toast. The URL is never logged;
+the only time it is written to disk is when you press **Simpan Webhook**.
 
 Notes:
 

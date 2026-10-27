@@ -1500,7 +1500,14 @@ notifyHit = function(unitName, quirk)
 	end
 	local ok, info = relayHit(unitName, quirk)
 	if ok then
-		log("discord relay " .. (info.delivered and "OK" or "dilewati") .. " (server)")
+		if info.delivered then
+			log("discord relay OK (server)")
+			return
+		end
+		-- Server tidak punya webhook tersimpan (delivered=false): pakai URL lokal
+		-- yang diisi lewat tab Misc, kalau ada. Tanpa URL lokal ini tidak melakukan apa-apa.
+		log("discord relay dilewati server (tanpa webhook) — coba webhook lokal")
+		sendWebhook(unitName, quirk)
 		return
 	end
 	log("WARN: relay HIT gagal (" .. tostring(info.code) .. "), fallback webhook lokal")
@@ -2449,6 +2456,61 @@ do
 			}
 		end
 
+		-- TextBox satu baris (label di atas, input full-width) + handle Set/Get.
+		local function CreateTextBox(parentPage, text, placeholder, initialValue)
+			local BoxFrame = Instance.new("Frame")
+			BoxFrame.Size = UDim2.new(1, -12, 0, 56)
+			BoxFrame.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+			BoxFrame.Parent = parentPage
+
+			local Corner = Instance.new("UICorner")
+			Corner.CornerRadius = UDim.new(0, 5)
+			Corner.Parent = BoxFrame
+
+			local Label = Instance.new("TextLabel")
+			Label.Size = UDim2.new(1, -16, 0, 16)
+			Label.Position = UDim2.new(0, 8, 0, 4)
+			Label.BackgroundTransparency = 1
+			Label.Text = text
+			Label.TextColor3 = Color3.fromRGB(240, 240, 240)
+			Label.Font = Enum.Font.GothamMedium
+			Label.TextSize = 11
+			Label.TextXAlignment = Enum.TextXAlignment.Left
+			Label.TextTruncate = Enum.TextTruncate.AtEnd
+			Label.Parent = BoxFrame
+
+			local InputBox = Instance.new("TextBox")
+			InputBox.Size = UDim2.new(1, -16, 0, 26)
+			InputBox.Position = UDim2.new(0, 8, 0, 24)
+			InputBox.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+			InputBox.Text = tostring(initialValue or "")
+			InputBox.PlaceholderText = placeholder or "Ketik..."
+			InputBox.PlaceholderColor3 = Color3.fromRGB(120, 120, 130)
+			InputBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+			InputBox.Font = Enum.Font.Code
+			InputBox.TextSize = 11
+			InputBox.ClearTextOnFocus = false
+			InputBox.TextXAlignment = Enum.TextXAlignment.Left
+			InputBox.Parent = BoxFrame
+
+			local BoxCorner = Instance.new("UICorner")
+			BoxCorner.CornerRadius = UDim.new(0, 4)
+			BoxCorner.Parent = InputBox
+
+			return {
+				-- Dipanggil dengan colon (box:Set(v)) -> parameter pertama self.
+				Set = function(_, newValue)
+					InputBox.Text = tostring(newValue or "")
+				end,
+				Get = function()
+					return InputBox.Text
+				end,
+				Focus = function(_)
+					InputBox:CaptureFocus()
+				end,
+			}
+		end
+
 		-- // Tab Farm //
 		local FarmPage = CreateTab("Farm")
 		local InfoPage = CreateTab("Info")
@@ -2593,6 +2655,51 @@ do
 
 		CreateButton(MiscPage, "Tes toast notification", function()
 			notify("Halo!", "Toast notification berjalan normal.")
+		end)
+
+		CreateLabel(MiscPage, "Discord Webhook")
+
+		-- Prefill dari nilai aktif: state.webhookUrl -> ENV.quirkFarm.webhookUrl -> file
+		-- (WEBHOOK_URL sudah di-resolve saat load dari webhook_url.txt).
+		local webhookBox = CreateTextBox(
+			MiscPage,
+			"URL webhook (disimpan ke webhook_url.txt)",
+			"https://discord.com/api/webhooks/...",
+			getWebhookUrl()
+		)
+
+		CreateButton(MiscPage, "Simpan Webhook", function()
+			local url = tostring(webhookBox:Get() or ""):gsub("^%s+", ""):gsub("%s+$", "")
+			local valid = url == ""
+				or url:match("^https://discord%.com/api/webhooks/") ~= nil
+				or url:match("^https://discordapp%.com/api/webhooks/") ~= nil
+			if not valid then
+				notify("Webhook", "URL tidak valid — harus https://discord.com/api/webhooks/...")
+				return
+			end
+
+			-- Berlaku langsung tanpa reload.
+			state.webhookUrl = url
+			WEBHOOK_URL = url
+			ENV.quirkFarm.webhookUrl = url
+			webhookBox:Set(url)
+
+			-- Persisten: file ini dibaca otomatis saat script dimuat berikutnya.
+			if type(writefile) ~= "function" then
+				notify("Webhook", "Berlaku untuk sesi ini — executor tidak punya writefile")
+				log("webhook " .. (url == "" and "dibersihkan" or "disimpan") .. " (writefile tidak tersedia)")
+				return
+			end
+			local okWrite = pcall(writefile, "webhook_url.txt", url)
+			if okWrite then
+				notify("Webhook", url == ""
+					and "Webhook dihapus (webhook_url.txt dikosongkan)"
+					or "Webhook disimpan — tidak perlu isi ulang saat load")
+				log("webhook " .. (url == "" and "dibersihkan" or "disimpan") .. " ke webhook_url.txt")
+			else
+				notify("Webhook", "Berlaku sekarang, tapi gagal menulis webhook_url.txt")
+				log("WARN: gagal menulis webhook_url.txt")
+			end
 		end)
 
 		CreateNotification("Quirk Farm Siap", "Pilih target lalu nyalakan Auto Farm di tab Farm.", 4)
