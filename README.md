@@ -247,21 +247,29 @@ there first using **PathfindingService** + `Humanoid:MoveTo`, then starts rollin
 - Measured: 107 studs away → arrived (8 studs from centre) in 4.6s, then 9/10 rolls
   accepted on the first rotation.
 
-### UI (Rayfield Gen 2)
+### UI (LightScriptHub, local)
 
-The script opens a **[Rayfield Gen 2](https://docs.sirius.menu/rayfield-gen2)** window
-(loaded from the official `https://sirius.menu/gen2` loader) with a **Farm** tab:
+The script builds its own **LightScriptHub** window — no external UI library and no
+`HttpGet`, so it works even when the executor blocks HTTP. It is a draggable 420×250
+window with a floating `HUB` button, toast notifications, and auto-scale for split-screen
+/ HP with a manual override:
 
-| Element | What it does |
-|---|---|
-| **Target Quirk** dropdown | all 20 quirks, rarest first (`Prodigy` is the default); warns when the pick has `weight >= 100` because the server refuses to protect those. Re-applies protections + blacklist immediately when switched while running |
-| **Auto Farm Quirk** toggle | ON starts (protect target → blacklist → roll), OFF stops and restores the old protection map |
-| **Blacklist unit langka** toggle | ON = units already holding a rare quirk (`weight < 100`) at start are skipped for the whole session |
-| **Stats** | 3 lines: `rolls · accepted · hits` / `rare dibuang · money spent` / `current unit · target` |
+| Tab | Element | What it does |
+|---|---|---|
+| Farm | **Target Quirk** dropdown | all 20 quirks, rarest first (`Prodigy` is the default); warns when the pick has `weight >= 100` because the server refuses to protect those. Re-applies protections + blacklist immediately when switched while running |
+| Farm | **Auto Farm Quirk** toggle | ON starts (protect target → blacklist → roll), OFF stops and restores the old protection map |
+| Farm | **Blacklist unit langka** toggle | ON = units already holding a rare quirk (`weight < 100`) at start are skipped for the whole session |
+| Farm | **Stats** | 3 lines updated live: `rolls · accepted · hits` / `rare dibuang · money spent` / `current unit · target` |
+| Info | live status | distance to the machine, remote channel (`ON/OFF · key · applied rev`), candidate count, blacklisted units, running state and target. Refreshes every 2 s while the window exists |
+| Info | buttons | **Cek jarak ke mesin Quirk**, **Tes HIT relay (Discord)** |
+| Misc | **Anti-AFK Otomatis** | hybrid `getconnections(Idled)` disable + `VirtualUser` fallback, on by default |
+| Misc | **Matikan 3D Render** | `RunService:Set3dRenderingEnabled(false)` |
+| Misc | **Skala GUI (%)** slider | manual window scale, 40–150 %; the default follows the auto scale. **Kembali ke Auto Scale** clears the override |
+| Misc | **Tes toast notification** | fires a sample toast |
 
 `AUTO_START = false` by default (enable in the config block if you want it to begin on
-load). If Rayfield fails to load, the script logs an error and continues **headless** —
-the farm still works via `getgenv().quirkFarm`, just without the window.
+load). If GUI creation fails, the script logs an error and continues **headless** — the
+farm still works via `getgenv().quirkFarm`, just without the window.
 
 Usage:
 
@@ -311,8 +319,8 @@ Notes:
   This is deliberate: protecting a non-target quirk globally would stall every holder.
 - On stop, the protection map from start is restored (the target stays protected), so
   other rare quirks return to whatever state they had before the session.
-- Idempotent: re-running stops the previous instance, Unloads the previous Rayfield
-  window, then builds exactly one new window.
+- Idempotent: re-running stops the previous instance, destroys the previous
+  `LightScriptHub` window (by name), then builds exactly one new window.
 - Only official remotes are fired (`Roll` with the unit key, `SetQuirkProtected`) —
   no force flag, no memory/state patching.
 - The target list is built from the game's own `Quirks` config when the script loads, so
@@ -322,7 +330,7 @@ Notes:
 
 ### Remote control from the web dashboard
 
-The farm can be driven from the [`web/`](./web) dashboard instead of the Rayfield
+The farm can be driven from the [`web/`](./web) dashboard instead of the in-game
 window: settings are stored in Supabase, **Start/Stop** is a button in the browser, and
 the script streams live stats back.
 
@@ -360,7 +368,7 @@ Notes:
 
 - The dashboard **never** rolls anything itself — it only writes config. The script
   remains the only actor that fires game remotes, so a stale browser tab cannot roll.
-- `Start`/`Stop` from the web behaves exactly like the Rayfield toggle (protections are
+- `Start`/`Stop` from the web behaves exactly like the in-game toggle (protections are
   applied on start, restored on stop).
 - Local UI still works while remote mode is on; the last applied remote `rev` wins on the
   next pull.
