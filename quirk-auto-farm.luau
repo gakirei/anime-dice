@@ -56,6 +56,7 @@
 --             testHit()      -- kirim HIT percobaan lewat relay (cek cepat dari console)
 --             distanceToMachine() -- jarak (studs) ke pusat zona Quirks, nil kalau tak terbaca
 --             teleportToMachine() -- pindah ke mesin pakai chunked teleport (juga saat stop)
+--             antiAfk()      -- { enabled, guarded }: status guard rejoin AFK game (18 menit)
 --             remote         -- { enabled, keySet, lastError, lastPullAt, appliedRev }
 -- Remote : OPEN CHANNEL — sync key TIDAK wajib, jadi device tidak menyimpan rahasia.
 --          Kalau key diisi, ia tetap dikirim sebagai x-sync-key (opsional, untuk
@@ -89,6 +90,7 @@ local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
 local PathfindingService = game:GetService("PathfindingService")
+local VirtualUser = game:GetService("VirtualUser")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -225,6 +227,93 @@ local targetDropdown -- handle CreateDropdown: Set(name, silent) / Refresh(list)
 local function log(msg)
 	print("[QuirkFarm] " .. msg)
 end
+
+--// Anti-AFK \\--
+-- Game punya LocalScript "PlayerScripts.AFK":
+--   task.delay(1080)  -- 18 MENIT tanpa InputBegan/TouchStarted
+--   -> TeleportService:Teleport(game.PlaceId, LocalPlayer) x20 tiap 0,5s  (rejoin)
+--   Timer di-reset hanya oleh InputBegan/TouchStarted asli.
+-- Player.Idled Roblox (20 menit) TIDAK dipakai game, dan VirtualUser tidak memicu
+-- InputBegan (terukur 0 event), jadi cara lama tidak menahan apa pun. Karena
+-- TeleportService:Teleport (client-side) hanya dipakai script AFK itu, kita blokir
+-- selama anti-AFK aktif; kalau hook tidak tersedia, script AFK-nya dihapus.
+local ANTI_AFK_ENABLED = true
+local afkGuardReady = false
+local afkBlockLogAt = 0
+
+local function installAfkGuard()
+	if afkGuardReady then
+		return true
+	end
+	if type(hookfunction) ~= "function" then
+		return false
+	end
+
+	local originalTeleport
+	local ok, err = pcall(function()
+		local teleportService = game:GetService("TeleportService")
+		originalTeleport = hookfunction(teleportService.Teleport, function(...)
+			if ANTI_AFK_ENABLED then
+				if os.clock() - afkBlockLogAt > 60 then
+					afkBlockLogAt = os.clock()
+					log("Anti-AFK: teleport rejoin diblokir (timer AFK game 18 menit)")
+				end
+				return
+			end
+			if originalTeleport then
+				return originalTeleport(...)
+			end
+		end)
+	end)
+
+	if ok then
+		afkGuardReady = true
+		log("Anti-AFK: TeleportService.Teleport diblokir selama anti-AFK aktif")
+		return true
+	end
+
+	-- Fallback: buang LocalScript AFK game supaya timer tidak di-arm ulang.
+	log("WARN: hook TeleportService gagal (" .. tostring(err) .. ") — hapus PlayerScripts.AFK")
+	pcall(function()
+		local afk = LocalPlayer.PlayerScripts:FindFirstChild("AFK")
+		if afk then
+			afk:Destroy()
+		end
+	end)
+	return false
+end
+
+-- Roblox idle (20 menit): klik VirtualUser + matikan koneksi Idled bawaan.
+local function enableRobloxIdleBypass()
+	if type(getconnections) == "function" then
+		pcall(function()
+			for _, conn in pairs(getconnections(LocalPlayer.Idled)) do
+				if conn.Disable then
+					conn:Disable()
+				elseif conn.Disconnect then
+					conn:Disconnect()
+				end
+			end
+		end)
+	end
+end
+
+installAfkGuard()
+
+if ENV.__quirkFarmIdledConn then
+	pcall(function()
+		ENV.__quirkFarmIdledConn:Disconnect()
+	end)
+end
+ENV.__quirkFarmIdledConn = LocalPlayer.Idled:Connect(function()
+	if ANTI_AFK_ENABLED then
+		pcall(function()
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.new())
+		end)
+	end
+end)
+enableRobloxIdleBypass()
 
 --// Helpers \\--
 -- Remote via WaitForChild berantai + timeout: aman bila Network belum ter-load.
@@ -1582,6 +1671,9 @@ ENV.quirkFarm = {
 		-- Diagnostik/manual: force=true supaya tetap jalan walau farm sedang stop.
 		return teleportToMachine(runId, true)
 	end,
+	antiAfk = function()
+		return { enabled = ANTI_AFK_ENABLED, guarded = afkGuardReady }
+	end,
 	remote = remoteInfo,
 	setTarget = function(name)
 		if not isKnownQuirk(name) then
@@ -2019,40 +2111,6 @@ do
 		local ContentCorner = Instance.new("UICorner")
 		ContentCorner.CornerRadius = UDim.new(0, 6)
 		ContentCorner.Parent = ContentContainer
-
-		-- // Anti-AFK hybrid (getconnections + VirtualUser) //
-		local antiAfkEnabled = true
-
-		local function EnableAntiAfk()
-			if type(getconnections) == "function" then
-				pcall(function()
-					for _, conn in pairs(getconnections(LocalPlayer.Idled)) do
-						if conn.Disable then
-							conn:Disable()
-						elseif conn.Disconnect then
-							conn:Disconnect()
-						end
-					end
-				end)
-			end
-		end
-
-		-- Satu koneksi Idled per load: putuskan milik generasi lama dulu (re-run).
-		if ENV.__quirkFarmIdledConn then
-			pcall(function()
-				ENV.__quirkFarmIdledConn:Disconnect()
-			end)
-		end
-		ENV.__quirkFarmIdledConn = LocalPlayer.Idled:Connect(function()
-			if antiAfkEnabled then
-				pcall(function()
-					VirtualUser:CaptureController()
-					VirtualUser:ClickButton2(Vector2.new())
-				end)
-			end
-		end)
-
-		EnableAntiAfk()
 
 		-- // Factory komponen //
 		local Tabs = {}
@@ -2613,11 +2671,12 @@ do
 		CreateLabel(MiscPage, "Sistem & Optimasi")
 
 		CreateToggle(MiscPage, "Anti-AFK Otomatis", true, function(value)
-			antiAfkEnabled = value
+			ANTI_AFK_ENABLED = value
 			if value then
-				EnableAntiAfk()
+				installAfkGuard()
+				enableRobloxIdleBypass()
 			end
-			notify("Anti-AFK", value and "Aktif" or "Nonaktif")
+			notify("Anti-AFK", value and "Aktif — rejoin AFK 18 menit diblokir" or "Nonaktif")
 		end)
 
 		CreateToggle(MiscPage, "Matikan 3D Render (hemat)", false, function(value)

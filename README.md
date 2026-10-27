@@ -293,7 +293,7 @@ window with a floating `HUB` button, toast notifications, and auto-scale for spl
 | Farm | **Stats** | 3 lines updated live: `rolls · accepted · hits` / `rare dibuang · money spent` / `current unit · target` |
 | Info | live status | distance to the machine, remote channel (`ON/OFF · key · applied rev`), candidate count, blacklisted units, running state and target. Refreshes every 2 s while the window exists |
 | Info | buttons | **Cek jarak ke mesin Quirk**, **Tes HIT relay (Discord)** |
-| Misc | **Anti-AFK Otomatis** | hybrid `getconnections(Idled)` disable + `VirtualUser` fallback, on by default |
+| Misc | **Anti-AFK Otomatis** | blocks the game's 18-minute AFK rejoin via a `TeleportService.Teleport` hook, plus the `VirtualUser` idle bypass, on by default |
 | Misc | **Matikan 3D Render** | `RunService:Set3dRenderingEnabled(false)` |
 | Misc | **Skala GUI (%)** slider | manual window scale, 40–150 %; the default follows the auto scale. **Kembali ke Auto Scale** clears the override |
 | Misc | **Tes toast notification** | fires a sample toast |
@@ -301,6 +301,36 @@ window with a floating `HUB` button, toast notifications, and auto-scale for spl
 `AUTO_START = false` by default (enable in the config block if you want it to begin on
 load). If GUI creation fails, the script logs an error and continues **headless** — the
 farm still works via `getgenv().quirkFarm`, just without the window.
+
+### Game AFK (18-minute rejoin)
+
+The game ships its own AFK handler as a LocalScript (`PlayerScripts.AFK`). It does **not**
+use Roblox's `Player.Idled`:
+
+```lua
+task.delay(1080, function()                                  -- 18 minutes
+    for _ = 1, 20 do
+        TeleportService:Teleport(game.PlaceId, LocalPlayer)   -- rejoin the same place
+        task.wait(0.5)
+    end
+end)
+```
+
+- The timer is re-armed only by **real `UserInputService.InputBegan` / `TouchStarted`**.
+- Roblox's idle event fires at 20 minutes, so an `Idled`-based anti-AFK is both too late
+  and watching the wrong event.
+- `VirtualUser:ClickButton2` does **not** raise `InputBegan` (measured: 0 events), so the
+  classic exploit anti-AFK does nothing against this script.
+
+**Anti-AFK Otomatis (Misc)** therefore hooks `TeleportService.Teleport`: while enabled,
+client-side teleport calls are dropped, so the 18-minute rejoin never happens. The toggle
+enables/disables the guard at runtime; Roblox's own idle (20 min) is still handled by the
+`VirtualUser` click. If the executor has no `hookfunction`, the script destroys
+`PlayerScripts.AFK` instead and logs a warning.
+
+```lua
+print(getgenv().quirkFarm.antiAfk())   -- { enabled = true, guarded = true }
+```
 
 Usage:
 
