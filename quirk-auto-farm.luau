@@ -55,6 +55,7 @@
 --             relayHit(unit, quirk) -- kirim HIT lewat server (Discord diposting server)
 --             testHit()      -- kirim HIT percobaan lewat relay (cek cepat dari console)
 --             distanceToMachine() -- jarak (studs) ke pusat zona Quirks, nil kalau tak terbaca
+--             teleportToMachine() -- pindah ke mesin pakai chunked teleport (juga saat stop)
 --             remote         -- { enabled, keySet, lastError, lastPullAt, appliedRev }
 -- Remote : OPEN CHANNEL — sync key TIDAK wajib, jadi device tidak menyimpan rahasia.
 --          Kalau key diisi, ia tetap dikirim sebagai x-sync-key (opsional, untuk
@@ -124,6 +125,19 @@ local WALK_NEAR_DIST = 40 -- sudah dianggap "di mesin" bila jarak ke pusat zona 
 local WALK_TIMEOUT = 150 -- batas total berjalan; lewat ini = gagal, arahkan manual
 local WALK_WAYPOINT_TIMEOUT = 12 -- batas per waypoint sebelum path dihitung ulang
 local WALK_RECOMPUTE_LIMIT = 6 -- jumlah path yang boleh dihitung ulang
+-- Chunked teleport: anti-cheat memvalidasi PERPINDAHAN BERSIH per jendela waktu
+-- (~1s), ambang ~150 studs. Terukur di client:
+--   • 1 lompatan 150 studs = lolos; 160/175/183/190/200 = snap balik
+--   • 100 studs tiap 0,45s (222/s) = diterima sesaat, lalu di-revert ~1s kemudian
+--   • 12 studs tiap 0,1s (120/s) = 234 -> 29 studs dalam 2,5s, stabil 3s+
+-- Jadi batasnya LAJU (~<=150 studs/s), bukan ukuran per langkah. Ini juga
+-- melewati conveyor yang membuat pathfinding kebingungan (tanpa path sama sekali).
+local TELEPORT_WALK = true -- coba chunked teleport dulu, fallback ke pathfinding
+local TELEPORT_STEP = 12 -- studs per langkah (dengan jeda di bawah = 120 studs/s)
+local TELEPORT_DELAY = 0.1 -- jeda per langkah (detik)
+local TELEPORT_STOP_DIST = 28 -- berhenti sedekat ini ke pusat zona Quirks
+local TELEPORT_MAX_CHUNKS = 150 -- batas langkah per start (jaga-jaga kalau posisi ditolak)
+local TELEPORT_STALL_LIMIT = 15 -- langkah tanpa progres sebelum menyerah ke pathfinding
 local PROTECT_SETTLE_TIMEOUT = 3 -- detik menunggu replikasi SetQuirkProtected dikonfirmasi client
 local BLACKLIST_RARE_UNITS = true -- blacklist unit lama yang sudah pegang quirk langka (weight < 100) selain target
 
@@ -866,7 +880,7 @@ function stop()
 		stats.rolls, stats.accepted, stats.hits, stats.rareLost, stats.moneySpent))
 end
 
---// Auto-walk ke mesin Quirk (PathfindingService, bukan teleport) \\--
+--// Zona Quirk: helper jarak \\--
 local function getQuirksZone()
 	local zones = workspace:FindFirstChild("Zones")
 	return zones and zones:FindFirstChild("Quirks") or nil
@@ -882,8 +896,101 @@ local function distanceToMachine()
 	return (root.Position - zone.Position).Magnitude
 end
 
--- Berjalan sungguhan lewat Humanoid:MoveTo. Anti-cheat game menolak/snap-back
--- teleport, tapi gerakan normal diizinkan (terverifikasi).
+--// Auto-walk ke mesin Quirk: chunked teleport dulu, pathfinding sebagai fallback \\--
+-- Ambang anti-cheat adalah LAJU perpindahan (~150 studs/detik), bukan ukuran satu
+-- langkah: 12 studs tiap 0,1s (120/s) stabil, sedangkan 100 studs tiap 0,45s
+-- (222/s) di-revert ~1s kemudian. Tanpa pathfinding, conveyor tidak mengganggu.
+local function teleportToMachine(id, force)
+	local zone = getQuirksZone()
+	if not zone then
+		log("WARN: zona Quirks tidak ditemukan - arahkan manual")
+		return false
+	end
+
+	local hum, root
+	local function resolveCharacter()
+		local char = LocalPlayer.Character
+		hum = char and char:FindFirstChildOfClass("Humanoid")
+		root = char and char:FindFirstChild("HumanoidRootPart")
+		return char, hum, root
+	end
+	local char = resolveCharacter()
+	if not (hum and root) or hum.Health <= 0 then
+		return false
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { char }
+
+	-- Lantai di titik tujuan: jaga Y tetap di atas permukaan (tangga/slope/conveyor).
+	local function groundY(x, z, refY)
+		local hit = workspace:Raycast(Vector3.new(x, refY + 100, z), Vector3.new(0, -400, 0), params)
+		return hit and hit.Position.Y or nil
+	end
+
+	local refGround = groundY(root.Position.X, root.Position.Z, root.Position.Y)
+	local yOffset = root.Position.Y - (refGround or root.Position.Y)
+
+	local chunks = 0
+	local lastDist = math.huge
+	local stall = 0
+	while (force or state.running) and id == runId do
+		char = resolveCharacter()
+		if not (hum and root) or hum.Health <= 0 then
+			return false
+		end
+		params.FilterDescendantsInstances = { char }
+
+		local flat = Vector3.new(zone.Position.X - root.Position.X, 0, zone.Position.Z - root.Position.Z)
+		local dist = flat.Magnitude
+		if dist <= TELEPORT_STOP_DIST then
+			break
+		end
+		if chunks >= TELEPORT_MAX_CHUNKS then
+			log("WARN: chunk teleport berhenti di batas " .. tostring(TELEPORT_MAX_CHUNKS) .. " chunk")
+			break
+		end
+
+		local len = math.min(TELEPORT_STEP, dist - TELEPORT_STOP_DIST)
+		local targetFlat = root.Position + flat.Unit * len
+		local gy = groundY(targetFlat.X, targetFlat.Z, root.Position.Y)
+		local target = Vector3.new(targetFlat.X, (gy and (gy + yOffset)) or root.Position.Y, targetFlat.Z)
+
+		local rot = root.CFrame - root.CFrame.Position
+		char:PivotTo(CFrame.new(target) * rot)
+		chunks += 1
+		task.wait(TELEPORT_DELAY)
+
+		-- Revert guard: satu langkah yang tidak mendarat di target = server menolak.
+		local err = (root.Position - target).Magnitude
+		if err > math.max(6, len * 0.75) then
+			log(string.format("WARN: chunk teleport ditolak server (err %.0f studs) setelah %d langkah", err, chunks))
+			return false
+		end
+
+		-- Stall guard: conveyor/dinding bisa menahan progres walau PivotTo diterima.
+		if dist >= lastDist - 0.5 then
+			stall += 1
+			if stall >= TELEPORT_STALL_LIMIT then
+				log(string.format("WARN: teleport tidak ada progres %d langkah - fallback pathfinding", stall))
+				return false
+			end
+		else
+			stall = 0
+		end
+		lastDist = dist
+	end
+
+	task.wait(0.2)
+	local finalDist = distanceToMachine()
+	log(string.format("chunk teleport selesai: %d chunk, jarak akhir %s studs",
+		chunks, finalDist and string.format("%.0f", finalDist) or "?"))
+	return finalDist ~= nil and finalDist <= WALK_NEAR_DIST
+end
+
+-- Berjalan sungguhan lewat Humanoid:MoveTo. Dipakai sebagai fallback bila chunked
+-- teleport ditolak server. Gerakan normal selalu diizinkan anti-cheat.
 local function walkToMachine(id)
 	local zone = getQuirksZone()
 	if not zone then
@@ -1054,12 +1161,26 @@ local function start()
 	if AUTO_WALK then
 		local dist = distanceToMachine()
 		if dist ~= nil and dist > WALK_NEAR_DIST then
-			log(string.format("jarak ke mesin Quirk %.0f studs - berjalan otomatis", dist))
-			notify("Quirk Farm", "Berjalan ke mesin Quirk...")
-			if not walkToMachine(id) then
-				notify("Quirk Farm", "Tidak bisa mencapai mesin Quirk otomatis - dekatkan karakter lalu start lagi.")
-				stop()
-				return false
+			log(string.format("jarak ke mesin Quirk %.0f studs - menuju mesin otomatis", dist))
+
+			local arrived = false
+			if TELEPORT_WALK then
+				notify("Quirk Farm", string.format("Teleport chunked ke mesin Quirk (%.0f studs)...", dist))
+				arrived = teleportToMachine(id)
+				if arrived then
+					notify("Quirk Farm", "Tiba di mesin Quirk (chunked teleport)")
+				else
+					log("WARN: chunked teleport gagal - fallback ke pathfinding")
+					notify("Quirk Farm", "Teleport chunked gagal — beralih ke jalan kaki...")
+				end
+			end
+
+			if not arrived then
+				if not walkToMachine(id) then
+					notify("Quirk Farm", "Tidak bisa mencapai mesin Quirk otomatis - dekatkan karakter lalu start lagi.")
+					stop()
+					return false
+				end
 			end
 		end
 	end
@@ -1450,6 +1571,10 @@ ENV.quirkFarm = {
 	relayHit = relayHit,
 	testHit = testHit,
 	distanceToMachine = distanceToMachine,
+	teleportToMachine = function()
+		-- Diagnostik/manual: force=true supaya tetap jalan walau farm sedang stop.
+		return teleportToMachine(runId, true)
+	end,
 	remote = remoteInfo,
 	setTarget = function(name)
 		if not isKnownQuirk(name) then

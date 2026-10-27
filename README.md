@@ -230,22 +230,53 @@ On a hit: the unit is dropped from the candidate list (target is already protect
 start), the Discord embed fires, and the loop moves to the next unit. `stop()` restores
 the protection map captured at start, leaving the target protected.
 
-### Auto-walk to the machine
+### Auto-walk to the machine (chunked teleport)
 
 `start()` no longer needs you to stand at the machine. If the character is more than
-`WALK_NEAR_DIST` (40 studs) from the centre of `Workspace.Zones.Quirks`, the script walks
-there first using **PathfindingService** + `Humanoid:MoveTo`, then starts rolling.
+`WALK_NEAR_DIST` (40 studs) from the centre of `Workspace.Zones.Quirks`, it is moved there
+first, then rolling starts.
 
-- Teleport is not an option: the game's anti-cheat snaps a client-side `CFrame`/`PivotTo`
-  back within about a second (verified: 183 studs reverted). Real walking is allowed.
-- The path is recomputed when a waypoint is blocked or not reached within 12s, with jumps
-  on `Jump` waypoints and on stalls; at most 6 path attempts, 150s total.
-- If it cannot arrive, `start()` aborts with a notification instead of rolling from far
+The first attempt is a **chunked teleport** (`TELEPORT_WALK = true`). Pathfinding is only a
+fallback: the map has conveyor belts that drag the character faster than the waypoint
+logic expects, so a path across them keeps "stalling" and recomputing. Teleporting is not
+affected by moving surfaces at all.
+
+Why chunking is required (measured on the live client):
+
+| Attempt | Result |
+|---|---|
+| single `PivotTo` 150 studs | accepted |
+| single `PivotTo` 160 / 175 / 183 / 190 / 200 studs | snapped back to the previous position |
+| 30 × 6 studs @0.05s (180 studs total) | accepted, no revert (checked 2s later) |
+| 2 × 90 studs with a 1.2s pause | both accepted |
+| 3 × 100 studs @0.08s (265 studs in ~0.25s) | **reverted** ~0.5s later |
+| 2 × 100 studs @0.45s (222 studs/s) | accepted at first, **reverted** ~1s later |
+| 12 studs @0.1s (120 studs/s), 234 → 29 studs | accepted, still there 3s later |
+
+So the anti-cheat limits **net displacement per unit time (~150 studs/s)**, not the size of a
+single step and not the per-frame delta. Chunking only works while the sustained rate stays
+under that limit; sending 100-stud chunks every 0.45s is already too fast.
+
+The script therefore uses 12-stud steps every 0.1s (~120 studs/s). Measured on the live
+client: **234 → 29 studs from the centre in 2.5s**, and the position was still correct
+3 seconds later. If a step does not land where it was put (rejected), or 15 steps in a row
+make no progress (conveyor or wall), the loop gives up and `walkToMachine`
+(PathfindingService + `Humanoid:MoveTo`) takes over.
+
+- Ground height for every step is taken from a downward raycast, so slopes, stairs and the
+  conveyor surface are handled; the character keeps its current height offset.
+- Tunables: `TELEPORT_WALK`, `TELEPORT_STEP` (12), `TELEPORT_DELAY` (0.1),
+  `TELEPORT_STOP_DIST` (28), `TELEPORT_MAX_CHUNKS` (150), `TELEPORT_STALL_LIMIT` (15),
+  plus `AUTO_WALK`, `WALK_NEAR_DIST`, `WALK_TIMEOUT` for the fallback.
+- The fallback recomputes the path when a waypoint is blocked or not reached within 12s,
+  with jumps on `Jump` waypoints and on stalls; at most 6 path attempts, 150s total.
+- If neither arrives, `start()` aborts with a notification instead of rolling from far
   away (which the server would refuse anyway).
 - Rolling only begins after arrival, so no rolls are wasted on the walk.
-- Tunables in the script config: `AUTO_WALK`, `WALK_NEAR_DIST`, `WALK_TIMEOUT`.
-- Measured: 107 studs away → arrived (8 studs from centre) in 4.6s, then 9/10 rolls
-  accepted on the first rotation.
+- Exposed for diagnostics: `getgenv().quirkFarm.teleportToMachine()` and
+  `getgenv().quirkFarm.distanceToMachine()`.
+- Measured: 234 studs away → 29 studs from centre in 2.5s; pathfinding
+  fallback: 107 studs → arrived in 4.6s, then 9/10 rolls accepted.
 
 ### UI (LightScriptHub, local)
 
@@ -306,8 +337,9 @@ Notes:
 
 - Burns real in-game money — every accepted roll costs (Common roll cost ranges roughly
   5–2000 depending on the unit).
-- You no longer have to stand at the **Quirk machine**: `start()` walks there by itself
-  (see *Auto-walk to the machine*). Rolls are accepted from a fairly loose range
+- You no longer have to stand at the **Quirk machine**: `start()` teleports there in small
+  steps (falling back to walking — see *Auto-walk to the machine*). Rolls are accepted from
+  a fairly loose range
   (verified ~31 studs from the zone centre); if the server still refuses them, the farm
   stops after three refused units instead of spinning (verified: 99 studs away → 30 rolls,
   0 accepted, stopped after ~20s). Set `AUTO_WALK = false` to keep it fully manual.
