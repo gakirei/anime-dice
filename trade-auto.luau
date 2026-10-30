@@ -1,4 +1,8 @@
 --// Anime Dice - Trade Auto (web dashboard -> game) \\--
+-- CATATAN: modul ini sudah di-port ke quirk-auto-farm.luau (tab Trade, API
+-- getgenv().tradeAuto tetap sama). File ini dipertahankan untuk pemakaian
+-- standalone / rollback. JANGAN jalankan bersamaan dengan hub: dua listener
+-- TradeEvent akan mengirim offer dua kali.
 -- Menjalankan trade dengan pemain yang dipilih dari dashboard web, hanya
 -- menawarkan unit yang quirk-nya cocok, lalu Ready -> Accept otomatis dari sisi
 -- kita. Trade tetap diselesaikan oleh server lewat remote TradeService resmi.
