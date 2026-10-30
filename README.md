@@ -568,3 +568,83 @@ getgenv().animeDiceHub.tower.equipBest()
 getgenv().animeDiceHub.tower.status()     -- push status now
 ```
 
+## Trade automation (web → game)
+
+[`trade-auto.luau`](./trade-auto.luau) trades from the dashboard: you pick a **target player**
+and a **quirk**, the script sends the trade request, offers every matching unit, and presses
+**Ready → Accept** on our side. The partner still accepts manually — only our half is
+automated. There is **no in-game GUI**; the card on the account detail page is the whole
+control surface.
+
+| Direction | Path | Cadence |
+|---|---|---|
+| Browser → Supabase | PostgREST write to `public.trade_controls.config` (RLS: `owner_id = auth.uid()`) | on Save / Start / Stop (`rev` bumps) |
+| Script → Supabase | `POST /functions/v1/trade` `{action:"pull", userId}` | every 15 s, applies only when `rev` changed |
+| Script → Supabase | `POST /functions/v1/trade` `{action:"status", userId, status}` | every 30 s (server enforces 5 s) |
+| Supabase → Browser | realtime on `trade_controls` (15 s polling fallback) | live |
+
+### Setup
+
+1. Run `web/supabase/migrations/20261028000000_trade_control.sql` in the Supabase SQL editor
+   (after the tower migration; idempotent).
+2. Deploy the function: `supabase functions deploy trade --no-verify-jwt` (or paste
+   `web/supabase/functions/trade/index.ts` in the dashboard and disable JWT verification).
+3. Load the script, then press **Save** once in the Trade card — that creates the row.
+   Until it exists, `pull` returns `config: null` and `status` answers `404 not registered`.
+4. Pick the target from the live player list (**Players** come from the script's status
+   push, so allow up to ~30 s after the first Save), pick the quirk, press **Start trade**.
+
+### What the script does
+
+- **Candidates** are read from the live inventory: entries whose `EntryRegistry` kind is
+  `Unit`, that `TradeConfig.IsTradeable` accepts, and whose `attributes.quirk` equals the
+  configured quirk. Sorted by `level` descending, capped at `maxUnits` (1–20, default 20).
+- **Offers** go out with `ChangeOffer(key, 1)` every 0.15 s (server debounce is 0.1 s).
+  After 8 s — or as soon as every unit is confirmed — it stops and presses **Ready** once.
+- **Confirm** arrives only after both sides are ready; the script accepts 0.6 s later.
+  Any offer change resets both sides' ready/accept, so it never touches offers again once
+  it starts readying.
+- A trade that starts with **someone other than the target** is cancelled immediately, and
+  `Stop` / a target switch cancels the live trade once (the script ignores the resulting
+  `Ended` so it does not mark the session as finished).
+- **No matching unit** → the trade is cancelled with `state: "error"` and the reason in
+  `lastError` instead of offering an empty trade; change the quirk (which bumps `rev`) to
+  retry.
+- After a trade ends (`Completed` or not) the session stops until `rev` changes, so the
+  script does not immediately re-request the same player. The end reason is reported as
+  `lastError` for anything but `Completed`.
+
+Server rules it has to live with (all verified from the game's own `TradeService`): account
+age ≥ 14 days, ≥ 1000 rolls, target has requests enabled, 6 s request cooldown, 6 s request
+expiry, 20 unique entries per trade, `Tickets` untradeable.
+
+### Config / status contract
+
+`config` (written by the browser): `running`, `targetUserId`, `targetName`, `quirk`,
+`maxUnits` (1–20), `autoAccept`, `autoReady`, `rev`.
+
+`status` (written by the script, fixed whitelist): `running`, `state`
+(`idle|waiting_target|request_sent|in_trade|done|error`), `phase`, `target`, `targetUserId`,
+`quirk`, `matched`, `offered`, `maxUnits`, `players` (≤ 30 × `{id, name}`), `appliedRev`,
+`lastSeenAt`, `lastError`, `version`.
+
+### Console API
+
+```lua
+getgenv().tradeAuto.start()        -- local start (overrides config until the next rev)
+getgenv().tradeAuto.stop()         -- stop + cancel the live trade
+getgenv().tradeAuto.state          -- live state table
+getgenv().tradeAuto.pull()         -- pull config now
+getgenv().tradeAuto.pushStatus()   -- push status now
+```
+
+Notes:
+
+- Only official `TradeService` remotes are fired (`RequestTrade`, `RespondToRequest`,
+  `ChangeOffer`, `AdvanceTrade`, `CancelTrade`, `SetTradeRequestsEnabled`) — no hook, no
+  memory patching, and the partner's side is never automated.
+- `autoAccept` only accepts an **incoming** request from the configured target; it never
+  fires requests for anyone else.
+- Diagnostics: the console distinguishes a 404 from Supabase ("function not deployed") from
+  the edge function's own `404 not registered` (row missing → press Save in the web card).
+
