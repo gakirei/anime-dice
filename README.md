@@ -458,11 +458,13 @@ Notes:
   stop the farm, or post to your webhook beyond the 15s rate limit. To tighten later, set
   a sync key on the device — the function already accepts `x-sync-key` when present.
 
-## All-in-one hub (Collector + Quirk Farm)
+## All-in-one hub (Collector + Quirk Farm + Trade)
 
 [`quirk-auto-farm.luau`](./quirk-auto-farm.luau) is now the single-window hub. The
 existing Quirk Farm is unchanged; a **Collector** tab was added that snapshots the
-account's owned resources and POSTs them to the dashboard ingest function.
+account's owned resources and POSTs them to the dashboard ingest function, and a
+**Trade** tab hosts the auto-trade module ported from `trade-auto.luau` (same remote
+contract; the dashboard card is still the control surface).
 
 | Tab | Element | What it does |
 |---|---|---|
@@ -573,8 +575,12 @@ getgenv().animeDiceHub.tower.status()     -- push status now
 [`trade-auto.luau`](./trade-auto.luau) trades from the dashboard: you pick a **target player**
 and a **quirk**, the script sends the trade request, offers every matching unit, and presses
 **Ready → Accept** on our side. The partner still accepts manually — only our half is
-automated. There is **no in-game GUI**; the card on the account detail page is the whole
-control surface.
+automated. **This module now ships inside the hub** ([`quirk-auto-farm.luau`](./quirk-auto-farm.luau),
+**Trade** tab), which is also its only in-game UI: live state plus *Tarik config sekarang*,
+*Push status sekarang*, *Start lokal*, and *Stop*. The card on the account detail page
+remains the control surface (the tab does not replace it). `trade-auto.luau` is kept for
+standalone use and rollback — **do not run it alongside the hub**, because two
+`TradeEvent` listeners would double-fire offers.
 
 | Direction | Path | Cadence |
 |---|---|---|
